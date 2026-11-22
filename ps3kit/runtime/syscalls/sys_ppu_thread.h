@@ -47,6 +47,9 @@ typedef struct ppu_thread_info {
     int32_t      priority;
     int64_t      exit_status;
     int          joinable;
+    uint64_t     create_flags; /* flags the guest passed (SYS_PPU_THREAD_CREATE_JOINABLE = 1) */
+    uint32_t     generation;   /* bumped by every create in this slot */
+    int          host_done;    /* host thread proc has finished touching this slot */
     uint32_t     stack_addr;   /* guest stack base */
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */

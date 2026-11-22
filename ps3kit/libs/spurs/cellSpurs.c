@@ -743,6 +743,7 @@ static void spurs_prio_env(void)
     }
     s_prio_init = 1;
 }
+static volatile int g_gb_sched_mode; static inline int gb_sched_now(void);
 static u32 wkl_prio(u32 ea, u32 wid, u32 sn)
 {
     const u32 p = vm_read8(ea + wkl_info_off(wid) + 0x18 + sn);
@@ -773,16 +774,72 @@ static u32 wkl_ready(u32 ea, u32 wid)
     const u32 b = wid < 32 ? s_ready_boost[wid] : 0;
     return (b && r && r < b && spurs_ready_level()) ? b : r;
 }
+/* gen6boss PRIVATE (2026-11-21): GB_SCHED=1 -> SPURS_PRIO_SCHED behaviour (the game's priority rows) while ON;
+ * GB_SCHED=2 -> the same + General6 (wid 3) at priority 1 on every lane its row allows (admitted ahead of the others
+ * while it has released jobs; a running module yields to it). GB_SCHED_AB=1: alternate 15 s windows from the first
+ * admission, window 0 OFF (= the env / default path), odd windows ON; "[gbsched] window n ON|OFF" lines.
+ * Unset: nothing changes (g_gb_sched_mode 0). */
+/* GB_SCHED=3: only the admission changes: work before an idle re-run (SPURS_KICK_FIRST), General6 ahead of the
+ * others, round-robin among the rest; no priority rows, a running module never yields (poll as main).
+ * GB_SCHED_CAP=<n> (modes 2/3): General6 goes first only while it holds fewer than n lanes (a running General6
+ * keeps the boost up to n). GB_SCHED_NOYIELD=1 (mode 2): a running module does not yield to General6 in its poll. */
+/* GB_SCHED_LIM=<wid>:<k>[,...] (modes 2/3, while ON): that workload is not admitted to a new lane while General6
+ * runs on >= 1 lane and it already holds >= k lanes (e.g. 13:2 = RenderJobs). */
+static volatile int g_gb_sched_mode = -1, g_gb_sched_ab, g_gb_sched_on, g_gb_sched_cap, g_gb_sched_noyield;
+static u8 g_gb_lim[32];
+static volatile LONG g_gb_sched_win = -1;
+static ULONGLONG g_gb_sched_t0;
+static inline int gb_sched_now(void)
+{
+    if (__builtin_expect(g_gb_sched_mode < 0, 0)) {
+        const char* e = getenv("GB_SCHED"); const int m = e ? atoi(e) : 2;
+        const char* a = getenv("GB_SCHED_AB"); g_gb_sched_ab = a && *a == '1';
+        g_gb_sched_t0 = GetTickCount64(); g_gb_sched_on = (m > 0 && !g_gb_sched_ab);
+        const char* c = getenv("GB_SCHED_CAP"); g_gb_sched_cap = c ? atoi(c) : 0;
+        const char* y = getenv("GB_SCHED_NOYIELD"); g_gb_sched_noyield = y && *y == '1';
+        for (const char* q = getenv("GB_SCHED_LIM") ? getenv("GB_SCHED_LIM") : "13:2"; q && *q; ) {   /* <wid>:<k>[,...] */
+            char* e2; const unsigned long w = strtoul(q, &e2, 10);
+            if (*e2 != ':') break;
+            const unsigned long k = strtoul(e2 + 1, &e2, 10);
+            if (w < 32 && k < 16) { g_gb_lim[w] = (u8)(k + 1); fprintf(stderr, "[gbsched] wid %lu: at most %lu lanes while General6 runs\n", w, k); }
+            q = (*e2 == ',') ? e2 + 1 : NULL;
+        }
+        g_gb_sched_mode = m;
+        if (m) fprintf(stderr, "[gbsched] mode %d cap %d noyield %d%s\n", m, g_gb_sched_cap, g_gb_sched_noyield,
+                       g_gb_sched_ab ? ", A/B 15 s windows (window 0 OFF)" : "");
+    }
+    if (!g_gb_sched_mode) return 0;
+    if (g_gb_sched_ab) {
+        const LONG w = (LONG)((GetTickCount64() - g_gb_sched_t0) / 15000u), o = g_gb_sched_win;
+        if (w != o && InterlockedCompareExchange(&g_gb_sched_win, w, o) == o) {
+            g_gb_sched_on = w & 1;
+            fprintf(stderr, "[gbsched] window %ld %s (t %.1f s)\n", (long)w, (w & 1) ? "ON" : "OFF", (GetTickCount64() - g_gb_sched_t0) / 1000.0);
+        }
+    }
+    return g_gb_sched_on ? g_gb_sched_mode : 0;
+}
+/* General6's (wid 3) priority on a lane under GB_SCHED 2/3: 1 (first) unless capped (act = its lanes now). */
+static inline u32 gb_g6_prio(u32 wid, u32 p, u32 act, int is_cur, int for_poll)
+{
+    if (wid != 3 || !p || __builtin_expect(g_gb_sched_mode < 2, 1)) return p;
+    const int m = gb_sched_now();
+    if (m != 2 && m != 3) return p;
+    if (for_poll && g_gb_sched_noyield && !is_cur) return p;
+    if (g_gb_sched_cap > 0 && (is_cur ? act > (u32)g_gb_sched_cap : act >= (u32)g_gb_sched_cap)) return p;
+    return 1u;
+}
 static int spurs_prio_sched(void)
 {
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPURS_PRIO_SCHED"); s_on = e && *e == '1'; }
+    if (__builtin_expect(g_gb_sched_mode != 0, 0)) { const int m = gb_sched_now(); if (m == 1 || m == 2) return 1; }
     return s_on;
 }
 static int spurs_kick_first(void)
 {
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPURS_KICK_FIRST"); s_on = (e && *e == '1') || spurs_prio_sched(); }
+    if (__builtin_expect(g_gb_sched_mode != 0, 0) && gb_sched_now()) return 1;
     return s_on;
 }
 
@@ -893,8 +950,14 @@ static cw_hist s_cw_kpark_h, s_cw_klat_h;
  * reports a second and every run's end). The Dekker of spurs_line_committed: the change is visible before kquiet is
  * read; a kernel that stores kquiet = 1 after this load (seq_cst store + fence, then its last pass reads kseq and the
  * state) sees it; one that stored it before gets the bump and, if parked, the event. EVWAIT (2): always the bump. */
+/* zeroemu pool (ZP_POOL=1, zp_pool.inc) */
+static volatile int s_zp_any;
+static void zp_kick(struct SpursInst* si);
+static int zp_fill_wake(struct SpursInst* si, struct SpursPmSlot* slot);
+static void zp_wake_all(struct SpursInst* si);
 static inline void spurs_kernel_kick(struct SpursInst* si)
 {
+    if (s_zp_any) { zp_kick(si); return; }   /* zeroemu pool */
     const int m = spurs_kpark_mode();
     if (!m || cw_ab_off()) return;
     if (m == 1) {
@@ -942,6 +1005,11 @@ static void spurs_kernel_park(struct SpursInst* si, LONG snap, unsigned us, int 
 static void ef_line_committed(uint32_t line);
 static void spurs_line_committed(uint32_t line)
 {
+    if (s_zp_any)   /* zeroemu pool: work an SPU atomic made ready */
+        for (int i = 0; i < MAX_SPURS_INST; i++) {
+            const u32 ea = __atomic_load_n(&s_inst[i].ea, __ATOMIC_RELAXED);
+            if (ea && (line == ea || line == ea + 128u)) zp_kick(&s_inst[i]);
+        }
     if (spurs_kpark_mode() == 1 && !cw_ab_off())
         for (int i = 0; i < MAX_SPURS_INST; i++) {
             struct SpursInst* si = &s_inst[i];
@@ -987,7 +1055,7 @@ void spurs_external_event(void)
 {
     /* cpu (PARK / EVWAIT on): only a back-off this report clears is news for a waiting kernel (a workload not
      * backed off is admitted by any pass), so the kick -- and the store to a byte already 0 -- is skipped otherwise. */
-    const int kp = spurs_kpark_mode() && !cw_ab_off();
+    const int kp = (spurs_kpark_mode() && !cw_ab_off()) || s_zp_any;   /* zeroemu pool: kick only when cleared */
     for (int i = 0; i < MAX_SPURS_INST; i++) {
         struct SpursInst* si = &s_inst[i];
         if (!__atomic_load_n(&si->ea, __ATOMIC_ACQUIRE)) continue;
@@ -1189,16 +1257,19 @@ int spurs_wid_active(uint32_t ea, uint32_t wid)
     struct SpursInst* si = spurs_inst_find(ea);
     return si && wid < SPURS_MAX_WID ? (int)__atomic_load_n(&si->active[wid], __ATOMIC_ACQUIRE) : 0;
 }
+/* stask: ST_API_SPIN (runtime/spu/spu_stask.inc): the same two exclusive acquires, with a short TryAcquire spin
+ * before blocking; with the switch off it is AcquireSRWLockExclusive. */
+extern void st_srw_acquire(SRWLOCK* l);
 static s32 spurs_api_lock(u32 ea, struct SpursInst** out)
 {
     struct SpursInst* si = spurs_inst_find(ea);
     if (!si) return CELL_SPURS_CORE_ERROR_STAT;
-    AcquireSRWLockExclusive(&si->lock);
+    st_srw_acquire(&si->lock);
     if (si->ea != ea || !si->kernel_live || si->stopping || si->starting) {
         ReleaseSRWLockExclusive(&si->lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    st_srw_acquire(&s_workload_registry_lock);
     *out = si;
     return CELL_OK;
 }
@@ -2877,7 +2948,7 @@ u32 spurs_poll_select(u32 ea, u32 cur, u32 spu)
         if (!(enabled & (0x80000000u >> w)) || vm_read8(ea + wkl_state_off(w)) != 2 ||
             !s_workloads[w].in_use || s_workloads[w].spurs_ea != ea)
             continue;
-        const u32 p = wkl_prio(ea, w, spu);
+        const u32 p = gb_g6_prio(w, wkl_prio(ea, w, spu), si->active[3], w == cur, 1);
         if (!p) continue;
         if (w != cur && (g_spurs_wid_block & (1u << w))) continue;   /* nexec */
         const u32 ready = wkl_ready(ea, w);
@@ -2888,7 +2959,8 @@ u32 spurs_poll_select(u32 ea, u32 cur, u32 spu)
                 cur_ok = 1; cur_prio = p;
             }
         } else if (!prio) {
-            if (pick == 0x20 && (sig || ready > si->active[w])) pick = w;
+            if ((pick == 0x20 || (w == 3 && p == 1u)) && (sig || ready > si->active[w]) &&
+                (w != 3 || p != 1u || si->active[w] < wkl_maxcont(ea, w))) pick = w;   /* gen6boss GB_SCHED=3 */
         } else if ((sig || ready > si->active[w]) && p < pick_prio &&
                    si->active[w] < wkl_maxcont(ea, w)) {
             pick = w; pick_prio = p;
@@ -2933,6 +3005,7 @@ static int spurs_slot_fill(struct SpursInst* si, struct SpursPmSlot* slot, u32 e
         }
     }
     if (self) return 1;
+    if (s_zp_any && zp_fill_wake(si, slot)) return 1;   /* zeroemu pool */
     if (spurs_slot_wake()) {
         AcquireSRWLockExclusive(&slot->wlock);
         slot->gen++;
@@ -2986,6 +3059,10 @@ static int spurs_admit(struct SpursInst* si, u32 sn, u32 ea, u32 enabled,
             wprio = wkl_prio(ea, wid, 0);
             if (!wprio) wprio = wkl_prio(ea, wid, si->title_nspus - 1);
         }
+        wprio = gb_g6_prio(wid, wprio, si->active[wid], 0, 0);   /* gen6boss GB_SCHED 2/3 */
+        if (__builtin_expect(g_gb_sched_mode >= 2, 0) && wid < 32 && g_gb_lim[wid] && si->active[3] &&
+            si->active[wid] >= g_gb_lim[wid] - 1u && gb_sched_now() >= 2)
+            continue;   /* gen6boss GB_SCHED_LIM */
         if (!wprio)
             continue; /* priority zero makes this physical lane ineligible */
         u32 maxcont = wkl_maxcont(ea, wid);
@@ -3029,7 +3106,8 @@ static int spurs_admit(struct SpursInst* si, u32 sn, u32 ea, u32 enabled,
                                    : (si->pass_no & ((1u << si->idle[wid]) - 1)) != 0)))
             continue;
         if (kick_first) {
-            const u32 key = ((kicked ? 0u : 1u) << 16) | ((prio ? wprio : 0u) << 8) | checked;
+            const u32 key = ((kicked ? 0u : 1u) << 16) |
+                            ((prio ? wprio : (g_gb_sched_mode == 3 ? ((wid == 3 && wprio == 1u) ? 0u : 1u) : 0u)) << 8) | checked;
             if (key < best_key) { best_key = key; best = wid; }
             continue;
         }
@@ -3300,12 +3378,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     return 0;
 }
 
+#include "zp_pool.inc"   /* zeroemu pool */
+
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
     si->stopping = 0; si->cursor = si->pass_no = 0;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     memset(si->idle_due, 0, sizeof(si->idle_due));
+    if (zp_enabled()) return zp_start(si);   /* zeroemu pool */
     for (u32 sn = 0; sn < si->nspus; sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
         memset(slot, 0, sizeof(*slot));
@@ -3320,6 +3401,7 @@ failed:
     AcquireSRWLockExclusive(&si->lock);
     si->stopping = 1; WakeAllConditionVariable(&si->wake); spurs_kernel_kick(si);
     spurs_wake_slots(si);
+    zp_wake_all(si);   /* zeroemu pool */
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
@@ -3340,6 +3422,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     si->stopping = 1; WakeAllConditionVariable(&si->wake); spurs_kernel_kick(si);
     spurs_wake_slots(si);
+    zp_wake_all(si);   /* zeroemu pool */
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < si->nspus; sn++) {

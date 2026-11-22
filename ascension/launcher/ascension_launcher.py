@@ -21,7 +21,7 @@ from the disc), music, native (macOS Dock, fonts) and ui (the window).
 import ctypes
 import sys
 from pathlib import Path
-from app.config import LOG_DIR, SHOT, WINDOWS, load_settings
+from app.config import LOG_DIR, SHOT, WINDOWS, load_settings, merge_ingame, save_settings
 from app.game import disc_ps3_game, game_running, missing, prepare_game, release_disc, start_game
 from app.i18n import set_language, tr
 from app.ui import Launcher
@@ -37,6 +37,8 @@ def main():
         return 0
     if '--play' in sys.argv:
         s = load_settings()
+        if merge_ingame(s):          # changed in the game's own menu (F1) last time
+            save_settings(s)
         set_language(s['ui_language'])
         gone = missing(s)
         if gone:
@@ -50,6 +52,8 @@ def main():
             process, log = start_game(s, env, LOG_DIR / 'last_run.log')
             code = process.wait()
             log.close()
+            if merge_ingame(s):
+                save_settings(s)
         finally:
             release_disc(mounted)
         return code

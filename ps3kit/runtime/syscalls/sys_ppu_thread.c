@@ -77,12 +77,69 @@ static void table_unlock(void)
 #endif
 }
 
-/* Find a free slot. Returns index or -1. Must be called under lock. */
+/* A finished thread that nobody can join (created without
+ * SYS_PPU_THREAD_CREATE_JOINABLE, or detached) whose host thread is done with
+ * its slot. lv2 frees such a thread when it exits; this table kept it FINISHED
+ * forever, so every short-lived worker used a slot up for good. God of War
+ * Ascension starts a new "SaveDataUtil::SaveFileSaveProfile" thread for every
+ * checkpoint save and never joins it: after ~43 saves (tid 64) the create
+ * failed with EAGAIN, the game said nothing, and no checkpoint was written
+ * again for the rest of the session (Akuseru, v0.1.35, ~50 min; an EU log of
+ * 2026-11-21: last save tid=64 at 61 min, 34 more minutes played unsaved). */
+static int slot_reclaimable(const ppu_thread_info* t)
+{
+    return t->state == PPU_THREAD_STATE_FINISHED && t->host_done &&
+           (!(t->create_flags & 1) || !t->joinable);
+}
+
+static void slot_release_host(ppu_thread_info* t)
+{
+#ifdef _WIN32
+    if (t->host_thread) CloseHandle(t->host_thread);
+    if (t->finish_event) CloseHandle(t->finish_event);
+    t->host_thread = NULL;
+    t->finish_event = NULL;
+#else
+    if (t->joinable) pthread_detach(t->host_thread);   /* sys_ppu_thread_detach already did */
+    pthread_mutex_destroy(&t->finish_mutex);
+    pthread_cond_destroy(&t->finish_cond);
+#endif
+}
+
+#ifdef SAVEFIX_TEST
+/* Test builds only: SAVEFIX_TEST_CAP=<n> uses only the first n slots (reach
+ * the full table in minutes); SAVEFIX_TEST_OLD=1 never reclaims (old kit). */
+static int test_env_int(const char* name)
+{
+    const char* e = getenv(name);
+    return e ? atoi(e) : 0;
+}
+#endif
+
+/* Find a free slot. Returns index or -1. Must be called under lock. A FREE
+ * slot first; only when there is none, one that slot_reclaimable() allows,
+ * so nothing changes until the table is full -- where the old code failed. */
 static int find_free_slot(void)
 {
-    for (int i = 0; i < PPU_THREAD_MAX; i++) {
+    int max = PPU_THREAD_MAX, reclaim = 1;
+#ifdef SAVEFIX_TEST
+    { int cap = test_env_int("SAVEFIX_TEST_CAP"); if (cap > 1 && cap < max) max = cap; }
+    if (test_env_int("SAVEFIX_TEST_OLD")) reclaim = 0;
+#endif
+    for (int i = 0; i < max; i++) {
         if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
             return i;
+    }
+    for (int i = 1; reclaim && i < max; i++) {   /* slot 0 = main */
+        ppu_thread_info* t = &g_ppu_threads[i];
+        if (!slot_reclaimable(t)) continue;
+        static unsigned long s_reclaimed;
+        if (++s_reclaimed <= 20 || (s_reclaimed % 100) == 0)
+            fprintf(stderr, "[SYS] thread table full: reusing tid=%d (\"%s\", finished, not joinable) [%lu reused]\n",
+                    i + 1, t->name, s_reclaimed);
+        slot_release_host(t);
+        t->state = PPU_THREAD_STATE_FREE;
+        return i;
     }
     return -1;
 }
@@ -106,6 +163,7 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+    const uint32_t my_gen = info->generation;   /* set before the thread was started */
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -163,27 +221,38 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
-    /* Mark as finished */
+    /* Mark as finished. Only while the slot is still this thread's: a join can
+     * free it as soon as sys_ppu_thread_exit signals, and a create can then
+     * reuse it. A detached thread stays FINISHED (joinable 0) until
+     * find_free_slot reclaims it -- freeing it here, before the signal below
+     * and host_done, let a new thread take the slot while this one still
+     * wrote to it. */
     table_lock();
-    info->exit_status = (int64_t)info->ctx.gpr[3];
-
-    if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
-        info->state = PPU_THREAD_STATE_FREE;
-    } else {
+    int mine = info->generation == my_gen && info->state != PPU_THREAD_STATE_FREE;
+    if (mine) {
+        info->exit_status = (int64_t)info->ctx.gpr[3];
+        if (info->state == PPU_THREAD_STATE_DETACHED) info->joinable = 0;
         info->state = PPU_THREAD_STATE_FINISHED;
     }
     table_unlock();
 
     /* Signal anyone waiting for join */
 #ifdef _WIN32
-    SetEvent(info->finish_event);
+    if (mine) SetEvent(info->finish_event);
+#else
+    if (mine) {
+        pthread_mutex_lock(&info->finish_mutex);
+        info->finished = 1;
+        pthread_cond_signal(&info->finish_cond);
+        pthread_mutex_unlock(&info->finish_mutex);
+    }
+#endif
+    table_lock();
+    if (mine && info->generation == my_gen && info->state != PPU_THREAD_STATE_FREE) info->host_done = 1;
+    table_unlock();
+#ifdef _WIN32
     return 0;
 #else
-    pthread_mutex_lock(&info->finish_mutex);
-    info->finished = 1;
-    pthread_cond_signal(&info->finish_cond);
-    pthread_mutex_unlock(&info->finish_mutex);
     return NULL;
 #endif
 }
@@ -344,7 +413,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t arg          = LV2_ARG_U64(ctx, 2);
     int32_t  priority     = LV2_ARG_S32(ctx, 3);
     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
+    uint64_t flags        = LV2_ARG_U64(ctx, 5);   /* SYS_PPU_THREAD_CREATE_JOINABLE = 1, _INTERRUPT = 2 */
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
 
     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
@@ -355,11 +424,18 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     int slot = find_free_slot();
     if (slot < 0) {
         table_unlock();
+        static unsigned long s_full;
+        if (++s_full <= 20 || (s_full % 100) == 0)
+            fprintf(stderr, "[SYS] sys_ppu_thread_create FAILED: thread table full (%d), EAGAIN [%lu times]\n",
+                    PPU_THREAD_MAX, s_full);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
     ppu_thread_info* t = &g_ppu_threads[slot];
+    uint32_t gen = t->generation + 1;
     memset(t, 0, sizeof(*t));
+    t->generation   = gen;
+    t->create_flags = flags;
 
     /* Allocate guest stack */
     uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
@@ -420,9 +496,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_size, priority, (unsigned long long)flags);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
@@ -534,11 +610,11 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
-        } else {
-            t->state = PPU_THREAD_STATE_FINISHED;
-        }
+        /* A detached thread is freed by find_free_slot once its host thread is
+         * done (host_done); FREE here let a create reuse the slot while this
+         * thread was still running its exit path. */
+        if (t->state == PPU_THREAD_STATE_DETACHED) t->joinable = 0;
+        t->state = PPU_THREAD_STATE_FINISHED;
 
 #ifdef _WIN32
         SetEvent(t->finish_event);
@@ -675,7 +751,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    if (t->state == PPU_THREAD_STATE_FINISHED) {
+    if (t->state == PPU_THREAD_STATE_FINISHED && t->host_done) {
         /* Already finished, free it */
 #ifdef _WIN32
         CloseHandle(t->host_thread);
@@ -687,7 +763,9 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
 #endif
         t->state = PPU_THREAD_STATE_FREE;
     } else {
-        t->state = PPU_THREAD_STATE_DETACHED;
+        /* Still running, or finished but its host thread is still in its
+         * epilogue: find_free_slot reclaims it later (joinable 0). */
+        if (t->state != PPU_THREAD_STATE_FINISHED) t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;
 #ifndef _WIN32
         pthread_detach(t->host_thread);

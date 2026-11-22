@@ -870,6 +870,8 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+#include "spu_stask.inc"   /* stask: ST_FPC / ST_POOL / ST_API_SPIN (all off by default) */
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -1437,7 +1439,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    const unsigned long long st_t0 = st_disp_t0();   /* stask */
+    uint64_t fp = st_fingerprint(image, image_size);   /* stask: ST_FPC, else spu_workload_fingerprint */
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1522,6 +1525,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
+    if (st_pool_dispatch(j)) { st_disp_note(st_t0); return 1; }   /* stask: ST_POOL */
 #ifdef _WIN32
     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
      * chains are deep host call chains with fat lifted frames -- a 1MB stack
@@ -1531,6 +1535,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
+    st_disp_note(st_t0);   /* stask */
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
      * mmap'd and committed on touch, so this reserves address space rather

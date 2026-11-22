@@ -100,6 +100,19 @@ static struct {
     unsigned long long mv_stamp, cam_stamp, up_last_us;
     int cam_reset, up_prev_ok;
     unsigned win_up, win_up_skip;
+    /* in-game menu (rsx_ingame_menu.h, ovl): frame generation switched off by the player (the proxy stays and passes
+     * real frames through); frames left for which generation is held because the menu's panel is on screen; the pace
+     * frame generation chose at start and the limit the player had before it (frames a second, 0 = none); totals of
+     * frames with / without generation and of upscaled frames since start (the menu's proof lines). */
+    int user_off, menu_hold;
+    int live_init;                /* the upscaler is being made by the menu, not by the start-up switches */
+    double fg_cap, user_cap;
+    unsigned long long tot_gen, tot_off, tot_up, tot_vel;
+    /* ovl3: this frame's generation decision (fsr3_fg_decide; made once per frame, also by the in-game overlay layer
+     * before it draws) and the UI layer handed to AMD's swap chain (fsr3_fg_ui: the panel + FPS counter, composed by
+     * the swap chain onto the real AND the generated frame, so they never go through frame generation) */
+    unsigned long long dec_stamp; int dec_enable, dec_game, dec_hold;
+    ID3D12Resource* ui_res; unsigned long long ui_stamp; int ui_reg, ui_fail;
 } s_fsr3;
 #define FSR3_VEL_NONE 30000.0f
 
@@ -127,6 +140,7 @@ static int fsr3_patch(const char* name, const char* text)
     return pt && strstr(pt, text) ? 1 : 0;
 }
 
+static int fsr3_dll_load(void);
 /* FSR3_FG asked for, the DLLs found and the MLAA patch on: 1. Logs why not otherwise. */
 /* 0.1.26: the live-draw GPU's name (rsx_live_draw.c fills it when the device is made) */
 static wchar_t s_ld_gpu_name[128];
@@ -204,6 +218,19 @@ static int fsr3_fg_load(void)
         s_fsr3.want = 0;
         if (!s_fsr3.scale_want) return 0;
     }
+    if (!fsr3_dll_load()) return 0;
+    done = 1;
+    return 1;
+}
+
+/* AMD's loader DLL and its entry points (once; also from the in-game menu when FSR is switched on while playing).
+ * 1 when they are there. Leaves the DLL search path on FSR3_DIR: the caller puts it back (SetDllDirectoryW(NULL))
+ * once its contexts are made. */
+static int fsr3_dll_load(void)
+{
+    static int st = -1;
+    if (st >= 0) return st;
+    st = 0;
     wchar_t dir[MAX_PATH] = L"";
     const char* d = getenv("FSR3_DIR");
     if (d && d[0]) MultiByteToWideChar(CP_UTF8, 0, d, -1, dir, MAX_PATH);
@@ -230,7 +257,7 @@ static int fsr3_fg_load(void)
         printf("[fsr3] frame generation off: the loader DLL lacks the ffx entry points\n");
         return 0;
     }
-    done = 1;
+    st = 1;
     return 1;
 }
 
@@ -628,6 +655,7 @@ static int fsr3_fg_make_swapchain(void* factory, ID3D12Device* dev, ID3D12Comman
             while (cap > 60.5) cap /= 2.0;
             const char* l = getenv("PS3_FPS_LIMIT");
             const double have = l ? atof(l) : 0.0;
+            s_fsr3.fg_cap = cap; s_fsr3.user_cap = have;   /* in-game menu: both paces, for switching while playing */
             if (have <= 0.0 || have > cap + 0.01) {
                 char v[32]; snprintf(v, sizeof v, "%.3f", cap);
                 SetEnvironmentVariableA("PS3_FPS_LIMIT", v); _putenv_s("PS3_FPS_LIMIT", v);
@@ -666,18 +694,18 @@ static int fsr3_fg_make_swapchain(void* factory, ID3D12Device* dev, ID3D12Comman
 
 /* Right before Present on the proxy. game: a game frame (not a movie, not the loading turbo). */
 static void fsr3_frame_end(void);
-static void fsr3_fg_before_present(int game)
+/* ovl3: whether this frame gets a generated frame. Made once per frame (frame_id), the first time it is asked: by the
+ * in-game overlay layer before it draws (ld_fgui_frame) or else right before Present -- both then agree. The floor
+ * is counted here, once per frame. */
+static int fsr3_fg_decide(int game)
 {
-    if (!s_fsr3.on) {   /* upscaling alone: the frame's bookkeeping only */
-        if (s_fsr3.scale_on) { s_fsr3.frame_id++; fsr3_frame_end(); }
-        return;
-    }
+    if (s_fsr3.dec_stamp == s_fsr3.frame_id + 1 && s_fsr3.dec_game == game) return s_fsr3.dec_enable;
+    const int first = s_fsr3.dec_stamp != s_fsr3.frame_id + 1;
     const unsigned long long now = fsr3_now_us();
-    const float dt = s_fsr3.last_us ? (float)(now - s_fsr3.last_us) / 1000.0f : 16.7f;
-    s_fsr3.last_us = now;
     /* camera mode: only frames with a scene camera and depth (menus, movies, loading screens: passed through) */
     const int scene = s_fsr3.cam_on ? (s_fsr3.have && s_fsr3.rawdepth && s_fsr3.pso) : 1;
     /* the floor (counted on game frames only) */
+    if (first) {
     if (game && s_fsr3.floor_fps > 0.0f) {
         if (!s_fsr3.fl_us) s_fsr3.fl_us = now;
         s_fsr3.fl_n++;
@@ -699,7 +727,55 @@ static void fsr3_fg_before_present(int game)
         }
     }
     if (s_fsr3.below) s_fsr3.win_floor++;
-    const int enable = game && scene && !s_fsr3.below;
+    s_fsr3.dec_hold = s_fsr3.menu_hold > 0;
+    if (s_fsr3.menu_hold > 0) s_fsr3.menu_hold--;
+    }
+    /* in-game menu: no generated frames when the player switched generation off; and none while its panel is on
+     * screen (+ a few frames after) ONLY when the UI layer cannot be used (menu_hold, fallback) */
+    const int menu_no = s_fsr3.user_off || s_fsr3.dec_hold;
+    s_fsr3.dec_enable = game && scene && !s_fsr3.below && !menu_no;
+    s_fsr3.dec_stamp = s_fsr3.frame_id + 1; s_fsr3.dec_game = game;
+    return s_fsr3.dec_enable;
+}
+/* ovl3: the UI layer for this Present (res = the overlay's own texture, display size, premultiplied alpha, in
+ * PIXEL_SHADER_RESOURCE; NULL = none: the overlay was drawn into the frame itself). AMD's swap chain copies it at
+ * Present (internal double buffering) and composes it onto the real and the generated frame. 0 when refused. */
+static int fsr3_fg_ui(ID3D12Resource* res)
+{
+    if (!s_fsr3.on || s_fsr3.ui_fail) return res == NULL;
+    if (!res && !s_fsr3.ui_reg) return 1;   /* nothing registered: nothing to take away */
+    struct ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 u; memset(&u, 0, sizeof u);
+    u.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
+    if (res) {
+        u.uiResource = fsr3_res(res, s_fsr3.w, s_fsr3.h, FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM);
+        u.uiResource.description.usage = FFX_API_RESOURCE_USAGE_READ_ONLY;
+        u.uiResource.state = FFX_API_RESOURCE_STATE_PIXEL_READ;
+        u.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
+                  FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+    }
+    const ffxReturnCode_t rc = s_fsr3.Configure(&s_fsr3.sc_ctx, &u.header);
+    if (rc != FFX_API_RETURN_OK) {
+        if (res) { s_fsr3.ui_fail = 1; printf("[fsr3] UI layer not taken by the swap chain (ffx %u): overlay drawn into the frame, generation rests under the panel\n", (unsigned)rc); }
+        return 0;
+    }
+    if (res && !s_fsr3.ui_reg) { static int logs; if (logs++ < 4) printf("[fsr3] UI layer on: the overlay is composed onto real and generated frames\n"); fflush(stdout); }
+    s_fsr3.ui_reg = res != NULL;
+    return 1;
+}
+static void fsr3_fg_before_present(int game)
+{
+    if (!s_fsr3.on) {   /* upscaling alone: the frame's bookkeeping only */
+        if (s_fsr3.scale_on) { s_fsr3.frame_id++; fsr3_frame_end(); }
+        return;
+    }
+    const unsigned long long now = fsr3_now_us();
+    const float dt = s_fsr3.last_us ? (float)(now - s_fsr3.last_us) / 1000.0f : 16.7f;
+    s_fsr3.last_us = now;
+    const int enable = fsr3_fg_decide(game);
+    /* ovl3: the overlay's layer when the overlay drew into it this frame (ld_fgui_frame: only on frames with
+     * generation), else none */
+    (void)fsr3_fg_ui(s_fsr3.ui_stamp == s_fsr3.frame_id + 1 ? s_fsr3.ui_res : NULL);
+    s_fsr3.ui_res = NULL;
     int reset = !s_fsr3.was_enabled;
     if (enable && s_fsr3.cam_on) {
         if (fsr3_frame_camera()) reset = 1;
@@ -752,8 +828,8 @@ static void fsr3_fg_before_present(int game)
         s_fsr3.q->lpVtbl->ExecuteCommandLists(s_fsr3.q, 1, &l);
         s_fsr3.fv[i] = ++s_fsr3.fnext;
         s_fsr3.q->lpVtbl->Signal(s_fsr3.q, s_fsr3.fence, s_fsr3.fv[i]);
-        s_fsr3.win_gen++;
-    } else s_fsr3.win_off++;
+        s_fsr3.win_gen++; s_fsr3.tot_gen++;
+    } else { s_fsr3.win_off++; s_fsr3.tot_off++; }
     s_fsr3.was_enabled = enable;
     fsr3_frame_end();
     s_fsr3.win_game++;
@@ -825,7 +901,8 @@ static void fsr3_jitter_set(void)
 /* After the swap chain is made: the upscaler's context for render rw x rh -> the swap chain's bw x bh. */
 static void fsr3_scale_init(ID3D12Device* dev, ID3D12CommandQueue* q, unsigned rw, unsigned rh, unsigned bw, unsigned bh)
 {
-    if (!fsr3_fg_load() || !s_fsr3.scale_want) return;
+    /* in-game menu (live_init): switched on while playing, where the start-up switches said no FSR */
+    if (!(s_fsr3.live_init ? fsr3_dll_load() : fsr3_fg_load()) || !s_fsr3.scale_want) return;
     if (!s_fsr3.cam_on) { printf("[fsr3] upscaling off: it needs the scene camera (FSR3_FG_CAMERA=0)\n"); return; }
     if (rw > bw || rh > bh) { printf("[fsr3] upscaling off: render %ux%u above the swap chain %ux%u\n", rw, rh, bw, bh); return; }
     /* af-10: from a smaller picture (e.g. 1280x720 -> 2560x1440) Kratos still breaks up in fights even with the
@@ -961,8 +1038,23 @@ static int fsr3_upscale(ID3D12GraphicsCommandList* l, ID3D12Resource* src, unsig
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     l->lpVtbl->ResourceBarrier(l, 1, &b);
     s_fsr3.up_prev_ok = 1;
-    s_fsr3.win_up++;
+    s_fsr3.win_up++; s_fsr3.tot_up++;
     return 1;
+}
+
+/* In-game menu: anti-aliasing switched off while playing. The caller has waited for the GPU to be idle (nothing
+ * recorded or queued still names the context or its output). Depth, motion, the fence and the camera pass stay for
+ * the next switch-on (and for frame generation). */
+static void fsr3_scale_shutdown(void)
+{
+    s_fsr3.scale_on = 0;
+    if (s_fsr3.upout) {
+        s_fsr3.Destroy(&s_fsr3.up_ctx, NULL);
+        s_fsr3.up_ctx = NULL;
+        s_fsr3.upout->lpVtbl->Release(s_fsr3.upout); s_fsr3.upout = NULL;
+    }
+    s_fsr3.scale_want = 0; s_fsr3.native = 0;
+    s_fsr3.up_prev_ok = 0; s_fsr3.phases = 0; s_fsr3.jx = s_fsr3.jy = 0; s_fsr3.jit_advance = 0;
 }
 /* FSR3_PP_MS=1 (af-9, tests): the GPU time of the present section (FSR's upscale or SMAA/the present pass) from
  * timestamps; a ring of 8 frames, read 6 frames later; the mean printed every 10 s. */

@@ -109,6 +109,48 @@ extern "C" int ascension_patch_on(const char* name)
     return 0;
 }
 
+// The in-game settings menu (ps3kit libs/video/rsx_ingame_menu.h): one patch
+// switched in the RUNNING game. Only a PPU patch that is a single instruction
+// word: the lifted code reads that word each time it runs there (--patch-sites:
+// "the word in guest memory picks the translation"), and one aligned 4-byte
+// store is seen whole by the game's threads. A patch of several writes could be
+// caught half switched, and an SPU patch is matched when its program loads, so
+// both are refused. on: 1 / 0 = switch it; -1 = only ask whether it can be
+// switched. Returns 1 when done (or possible), -1 when not.
+// Used for "Disable Motion Blur": AMD FSR reads the moving objects from the
+// game's own motion-blur draws, so the menu turns the blur on with FSR.
+extern "C" int ascension_patch_set(const char* name, int on)
+{
+    if (!vm_base) return -1;
+    bool* state = const_cast<bool*>(patch_state());
+    for (int i = 0; i < kPatches; i++) {
+        const ascension_patch& p = k_patches[i];
+        if (strcmp(name, p.name)) continue;
+        if (strcmp(p.kind, "PPU") || p.count != 1) return -1;
+        const ascension_patch_write& pw = k_patch_writes[p.first];
+        if (pw.len != 4 || (pw.addr & 3u)) return -1;
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(vm_base + pw.addr, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+            !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mi.Protect & PAGE_GUARD))
+            return -1;
+#endif
+        if (on < 0) return 1;
+        uint32_t word;
+        memcpy(&word, k_patch_bytes + (on ? pw.patched : pw.orig), 4);
+#ifdef _WIN32
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(vm_base + pw.addr), (LONG)word);
+#else
+        memcpy(vm_base + pw.addr, &word, 4);
+#endif
+        state[i] = on != 0;
+        printf("[patches] %s switched %s in the running game (0x%08X)\n", p.name, on ? "on" : "off", pw.addr);
+        fflush(stdout);
+        return 1;
+    }
+    return -1;
+}
+
 namespace {
 void json_str(const char* s)
 {

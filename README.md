@@ -25,16 +25,17 @@ anyone can run (no Sony servers): see [Online multiplayer](#online-multiplayer).
 
 ## Download (ready to play)
 
-The [Releases](../../releases/latest) page has **GodOfWarAscension-0.1.35-windows.zip**: extract it anywhere and run the launcher. You still need your own copy of the game. Already playing an older version? Extract it **over your old folder**, or into a new folder and start the launcher once: your saves are copied over.
+The [Releases](../../releases/latest) page has **GodOfWarAscension-0.2.0-windows.zip**: extract it anywhere and run the launcher. You still need your own copy of the game. Already playing an older version? Extract it **over your old folder**, or into a new folder and start the launcher once: your saves are copied over.
 
 The ready-made build includes the hand-written native SPU code, so it is faster in heavy fights than a build made from this source alone.
 
 ## What has been fixed so far
 
-Highlights from 0.1.0 (2026-10-30) to 0.1.35. The full list is in [CHANGELOG.md](CHANGELOG.md).
+Highlights from 0.1.0 (2026-10-30) to 0.2.0. The full list is in [CHANGELOG.md](CHANGELOG.md).
 
 **Speed**
 - More of the game runs as real PC code (SPU jobs rewritten natively): much faster on 4-8 core CPUs (0.1.12, 0.1.22).
+- Native job pool, faster recompiled code and better job order: big gains on 2- and 4-core CPUs (0.2.0, see CHANGELOG.md).
 - Occlusion culling: objects hidden behind walls are not drawn (0.1.17, 0.1.21).
 - Cheaper draws in the graphics thread, and since 0.1.31 those speed-ups are on for everyone, not only with the FPS counter shown.
 - Thread placement tuned for 6-core CPUs, 16-core Ryzen X3D CPUs, and switched off where it hurt (8-core CPUs, Intel CPUs with E-cores).
@@ -58,6 +59,7 @@ Highlights from 0.1.0 (2026-10-30) to 0.1.35. The full list is in [CHANGELOG.md]
 **Controls, saves and launcher**
 - Controllers: full stick range on diagonals, right-stick evade, controllers that stopped after cutscenes, wireless controllers that froze during heavy vibration (0.1.31).
 - Saves: backups while you play, export and import, the autosave that went to the wrong folder (0.1.27), and saves carried over automatically when you install a new version in a new folder (0.1.30).
+- In-game settings menu (F1 or hold SELECT), trophies with a Trophies page in the launcher, 120 FPS and unlocked frame rate limits, saving in long sessions fixed (0.2.0).
 - US disc support, game folder or .iso picked directly (no RPCS3 decrypting), FAT32 split files joined, cheats and patches with tick boxes, PT-BR translation mod, 1.04 sound mix, skip intro and story movies.
 
 ## Performance

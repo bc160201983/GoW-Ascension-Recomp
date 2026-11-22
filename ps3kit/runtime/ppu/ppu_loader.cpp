@@ -1708,7 +1708,8 @@ static struct VmInlineInit {
         vm_inline_ok = !d;
         /* ...and the inline stores (vm_write*_inl) while no write one is. */
         static const char* const wvars[] = {
-            "PPU_WWATCH", "PPU_WVAL", "PPU_WW_GUARD", "PT", "PS3_NULL_SWEEP", "SPU_ATOM_EA", 0 };
+            "PPU_WWATCH", "PPU_WVAL", "PPU_WW_GUARD", "PT", "PS3_NULL_SWEEP", "SPU_ATOM_EA",
+            "SPU_WTRACE" /* codegen --cg st: the inline stores no longer test the wtrace window */, 0 };
         int w = 0;
         for (int i = 0; wvars[i]; i++) if (getenv(wvars[i])) w = 1;
         vm_store_inline_ok = !w;

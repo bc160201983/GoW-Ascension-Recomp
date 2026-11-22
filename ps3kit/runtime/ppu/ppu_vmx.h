@@ -25,7 +25,9 @@ extern "C" {
 
 #define VMX_SAT 0x00000001u
 #define VMX_NJ  0x00010000u
+#ifndef VMX_INL   /* codegen --cg vx: the lifted source defines it always_inline first */
 #define VMX_INL static inline
+#endif
 
 /* ---- element access (big-endian) ---- */
 VMX_INL uint16_t vmx_h(const uint8_t* v, int i) { return (uint16_t)(v[2 * i] << 8 | v[2 * i + 1]); }

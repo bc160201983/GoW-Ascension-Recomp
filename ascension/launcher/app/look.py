@@ -24,7 +24,8 @@ BG, PANEL, CARD, LINE = W.PAGE, W.CARD, W.RAISED, W.LINE
 TEXT, MUTED, ACCENT, ACCENT_HI = W.TEXT, W.MUTED, '#b8872f', W.GOLD
 GOLD, LOG_BG, LOG_FG, OFF = W.GOLD, W.FIELD, '#cfc6bc', W.DIM
 
-PAGES = ('home', 'graphics', 'game', 'controls', 'patches', 'mods', 'online', 'advanced', 'support', 'about')
+PAGES = ('home', 'graphics', 'game', 'controls', 'patches', 'mods', 'trophies', 'online', 'advanced', 'support',
+         'about')
 
 
 def translated(options):
@@ -470,7 +471,7 @@ class Look:
         self.draw_side_logo()
         self.nav, self.current = {}, None
         self.titles = {'home': tr('Home'), 'graphics': tr('Graphics'), 'game': tr('Game'), 'controls': tr('Controls'),
-                       'patches': tr('Patches'), 'mods': tr('Mods'), 'online': tr('Online'), 'advanced': tr('Advanced'),
+                       'patches': tr('Patches'), 'mods': tr('Mods'), 'trophies': tr('Trophies'), 'online': tr('Online'), 'advanced': tr('Advanced'),
                        'support': tr('Support'), 'about': tr('About'), 'search': tr('Search')}
         for name in PAGES:
             if name == 'support':          # the gold button under the list
@@ -517,6 +518,7 @@ class Look:
         self.build_controls()
         self.build_patches()
         self.build_mods()
+        self.build_trophies()
         self.build_online()
         self.build_advanced()
         self.build_support()
@@ -556,6 +558,8 @@ class Look:
             self.bar_play.pack(side='right', padx=(0, self.px(30)), before=self.saved_label)
         if name == 'mods':
             self.refresh_mods()
+        elif name == 'trophies':
+            self.refresh_trophies()
         elif name == 'game':
             self.refresh_backups()
         elif name == 'patches' and self.patch_list is None and not self.patch_error:
@@ -721,12 +725,17 @@ class Look:
         link = tk.Label(news.body, text=tr('Read all') + ' ›', bg=PANEL, fg=GOLD, font=(self.semi, 10), cursor='hand2')
         link.pack(side='right')
         link.bind('<Button-1>', lambda _e: webbrowser.open(updater.RELEASES_PAGE))
-        for item in NEWS:
-            mark = tk.Canvas(news.body, width=px(8), height=px(8), bg=PANEL, bd=0, highlightthickness=0)
+        rows = [news.body]
+        if len(NEWS) > 3:  # the 4th item on: a second row under the first, so the line never runs off the card
+            rows.append(tk.Frame(news.body.master, bg=PANEL))
+            rows[1].pack(fill='x', padx=px(20), pady=(0, px(12)))
+        for i, item in enumerate(NEWS):
+            row = rows[min(i // 3, len(rows) - 1)]
+            mark = tk.Canvas(row, width=px(8), height=px(8), bg=PANEL, bd=0, highlightthickness=0)
             d = px(4)
             mark.create_polygon(d, 0, 2 * d, d, d, 2 * d, 0, d, fill=W.RED, outline='')
             mark.pack(side='left', padx=(px(22), px(9)))
-            tk.Label(news.body, text=tr(item), bg=PANEL, fg='#d7d1c5', font=(self.ui, 10)).pack(side='left')
+            tk.Label(row, text=tr(item), bg=PANEL, fg='#d7d1c5', font=(self.ui, 10)).pack(side='left')
         self.refresh_home(checks=True)
 
     def quality_level(self, s):
@@ -1021,6 +1030,9 @@ class Look:
         return edge, gen
 
     def build_graphics_all(self, f):
+        if self.has('PS3_INGAME_SETTINGS'):
+            self.note(f, tr('While playing, F1 (or holding SELECT on the controller) opens these picture settings '
+                            'in the game. What you change there is saved here too.'), top=0)
         self.section(f, tr('Display'))
         self.row(f, tr('Display mode'), self.choice(f, 'display_mode', DISPLAY_MODES),
                  tr('In the game, {keys} switches between window and full screen.', keys=self.fullscreen_keys()))
@@ -1100,10 +1112,20 @@ class Look:
                 self.section(f, tr('Lighting'))
             self.check(f, 'smooth_glow', tr('Smoother glow at high resolutions'),
                        tr('Makes the glow around fire, magic and bright light smooth instead of dotty when the resolution is above 720p. On by default; it did not lower the frame rate in our tests. On a slow graphics card you can turn it off for a few more frames per second.'))
+        if self.has('PS3_NO_SHADOWS'):   # 2026-11-22: dynamic shadows off (flatter look), off by default
+            if not self.has('LD_AO') and not self.has('LD_FULLRES_FX'):
+                self.section(f, tr('Lighting'))
+            self.check(f, 'no_shadows', tr('Disable dynamic shadows (flatter look)'),
+                       tr("The game stops drawing its real-time shadow maps; the scene looks brighter and flatter. Can also be switched while playing (F1 menu, Display)."), badge=tr('NEW'))
         if self.has('LD_UBER'):   # host uber5: the ubershader, opt-in (game.game_environment sets its switches)
             self.section(f, tr('Shaders'))
             self.check(f, 'uber_shaders', tr('Fewer shader stutters (NVIDIA, experimental)'),
                        tr('When the game meets a shader it has not built yet, it draws that object for a moment with a slower all-purpose shader instead of pausing. In a big fight this cut the waiting for shaders about three times (tested on an RTX 5080). NVIDIA graphics cards only: on other cards the game turns it off by itself. Uses a little more GPU time while it is working. Experimental: turn it off if something looks wrong.'), badge=tr('NEW'))
+        if self.has('GP_PULL'):   # 0.2.0: GPU vertex decoding, opt-in (game.game_environment sets GP_PULL=1 W_VDIRECT=3)
+            if not self.has('LD_UBER'):
+                self.section(f, tr('Shaders'))
+            self.check(f, 'gp_pull', tr('GPU vertex decoding (experimental, faster in busy scenes)'),
+                       tr("The graphics card decodes the game's 3D model data itself instead of the processor. Faster in busy scenes, mostly on PCs with few CPU cores. Experimental: turn it off if something looks wrong."), badge=tr('NEW'))
         later = [(title, tr('not available yet')) for sw, title in (
             ('PS3_RSX_RENDERER', tr('Renderer (RPCS3 Vulkan / OpenGL)')), ('PS3_RENDER_SCALE', tr('Internal resolution')),
             ('PS3_ANISO', tr('Anisotropic filtering')), ('PS3_ASPECT', tr('Aspect ratio')),

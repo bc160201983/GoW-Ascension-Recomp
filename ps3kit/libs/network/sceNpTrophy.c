@@ -9,6 +9,7 @@
  */
 
 #include "sceNpTrophy.h"
+#include "np_trophy_data.h"   /* host/trophies: the set from the player's game files */
 #include "../system/cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
@@ -40,6 +41,13 @@
  * -----------------------------------------------------------------------*/
 
 static int s_trophy_initialized = 0;
+/* TROPHY_TRACE=1: one line per trophy call that matters (host/trophies) */
+static int trophy_trace(void)
+{
+    static int t = -1;
+    if (t < 0) { const char* e = getenv("TROPHY_TRACE"); t = e && e[0] && e[0] != '0'; }
+    return t;
+}
 static char s_storage_path[512] = "gamedata/trophies";
 
 /* Per-context data */
@@ -50,6 +58,7 @@ typedef struct {
     u8                       unlocked[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
     u64                      unlock_time[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
     u32                      total_trophies;
+    int                      has_data;     /* host/trophies: the real set is known (count, platinum rule) */
 } TrophyContext;
 
 typedef struct {
@@ -98,7 +107,10 @@ static void trophy_save(TrophyContext* ctx)
     trophy_ensure_dir();
     trophy_get_filepath(&ctx->commId, filepath, sizeof(filepath));
 
-    fp = fopen(filepath, "w");
+    /* host/trophies: written to <file>.tmp and then put in place, so a crash never leaves a half file */
+    char tmppath[1100];
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp", filepath);
+    fp = fopen(tmppath, "w");
     if (!fp) {
         printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n",
                filepath);
@@ -106,7 +118,7 @@ static void trophy_save(TrophyContext* ctx)
     }
 
     fprintf(fp, "{\n  \"trophies\": [");
-    for (u32 i = 0; i < ctx->total_trophies; i++) {
+    for (u32 i = 0; i < SCE_NP_TROPHY_MAX_NUM_TROPHIES; i++) {   /* every id kept, also ones outside the set */
         if (ctx->unlocked[i]) {
             if (!first) fprintf(fp, ",");
             fprintf(fp, "\n    { \"id\": %u, \"timestamp\": %llu }",
@@ -115,8 +127,54 @@ static void trophy_save(TrophyContext* ctx)
         }
     }
     fprintf(fp, "\n  ]\n}\n");
-    fclose(fp);
+    const int bad = ferror(fp);
+    if (fclose(fp) != 0 || bad || !np_trophy_replace_file(tmppath, filepath)) {
+        remove(tmppath);
+        printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n", filepath);
+    }
 }
+
+/* host/trophies: the platinum is the system's: given when every trophy that counts for it is unlocked.
+ * Returns its id when it was given now, else -1. */
+static s32 trophy_platinum_check(TrophyContext* ctx)
+{
+    const int plat = np_trophy_data_platinum();
+    if (!ctx->has_data || plat < 0 || ctx->unlocked[plat]) return -1;
+    const int n = np_trophy_data_count();
+    for (int i = 0; i < n; i++) {
+        const np_trophy_def* d = np_trophy_data_get(i);
+        if (i != plat && d && d->pid == plat && !ctx->unlocked[i]) return -1;
+    }
+    ctx->unlocked[plat] = 1;
+    ctx->unlock_time[plat] = (u64)time(NULL);
+    printf("[trophy] platinum %d unlocked (every trophy of the set is unlocked)\n", plat);
+    np_trophy_event_push(plat, ctx->unlock_time[plat]);
+    return plat;
+}
+
+#if defined(NP_TROPHY_TEST) && NP_TROPHY_TEST && defined(_WIN32)
+/* TEST BUILDS ONLY (-DNP_TROPHY_TEST=1, build\trophy): TROPHY_TEST_UNLOCK=<id>[,<id>...] unlocks those ids through
+ * sceNpTrophyUnlockTrophy TROPHY_TEST_DELAY_S seconds (default 20) after the registration, TROPHY_TEST_GAP_S apart. */
+#include <windows.h>
+static DWORD WINAPI trophy_test_thread(LPVOID arg)
+{
+    const s32 ctx = (s32)(intptr_t)arg;
+    const char* e = getenv("TROPHY_TEST_UNLOCK");
+    const char* d = getenv("TROPHY_TEST_DELAY_S");
+    const char* gp = getenv("TROPHY_TEST_GAP_S");
+    Sleep((DWORD)((d && *d ? atof(d) : 20.0) * 1000.0));
+    for (const char* p = e; p && *p; ) {
+        while (*p == ',' || *p == ' ') p++;
+        if (!*p) break;
+        const int id = atoi(p);
+        const s32 r = sceNpTrophyUnlockTrophy(ctx, 1, id, NULL);
+        printf("[trophy] TEST unlock %d -> 0x%08X\n", id, (unsigned)r);
+        while (*p && *p != ',') p++;
+        Sleep((DWORD)((gp && *gp ? atof(gp) : 1.0) * 1000.0));
+    }
+    return 0;
+}
+#endif
 
 static void trophy_load(TrophyContext* ctx)
 {
@@ -322,8 +380,31 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     if (!g_ps3_guest_caller) return SCE_NP_TROPHY_ERROR_UNKNOWN;
 
     /* Load any previously saved trophy data */
+    np_trophy_lock();
     trophy_load(&s_contexts[context]);
     s_contexts[context].registered = 1;
+    /* host/trophies: the real set from the game files (none: everything as before) */
+    {
+        TrophyContext* c = &s_contexts[context];
+        char full[32];
+        snprintf(full, sizeof full, "%.9s_%02u", c->commId.data, (unsigned)c->commId.num);
+        const int n = np_trophy_data_load(full, s_storage_path);
+        if (n > 0) {
+            c->has_data = 1;
+            c->total_trophies = (u32)n;
+            u32 have = 0;
+            for (int i = 0; i < n; i++) have += c->unlocked[i] ? 1u : 0u;
+            printf("[trophy] %u of %d unlocked (%s)\n", have, n, full);
+            if (trophy_platinum_check(c) >= 0) trophy_save(c);   /* older saves that already had every other trophy */
+        }
+    }
+    np_trophy_unlock();
+#if defined(NP_TROPHY_TEST) && NP_TROPHY_TEST && defined(_WIN32)
+    { const char* e = getenv("TROPHY_TEST_UNLOCK");
+      if (e && *e) { HANDLE th = CreateThread(NULL, 0, trophy_test_thread, (LPVOID)(intptr_t)context, 0, NULL);
+                     printf("[trophy] TEST build: TROPHY_TEST_UNLOCK=%s %s\n", e, th ? "armed" : "FAILED");
+                     if (th) CloseHandle(th); } }
+#endif
 
     printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
            "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
@@ -484,11 +565,22 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
 
-    if (trophyId < 0 || (u32)trophyId >= s_contexts[context].total_trophies)
+    if (trophyId < 0 || (u32)trophyId >= s_contexts[context].total_trophies) {
+        if (trophy_trace()) printf("[trophy] trace UnlockTrophy(%d) -> invalid id\n", trophyId);
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    }
 
-    if (s_contexts[context].unlocked[trophyId])
+    if (s_contexts[context].has_data && trophyId == np_trophy_data_platinum()) {   /* as on the PS3 */
+        if (trophy_trace()) printf("[trophy] trace UnlockTrophy(%d) -> the platinum cannot be unlocked\n", trophyId);
+        return SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK;
+    }
+
+    np_trophy_lock();
+    if (s_contexts[context].unlocked[trophyId]) {
+        np_trophy_unlock();
+        if (trophy_trace()) printf("[trophy] trace UnlockTrophy(%d) -> already unlocked\n", trophyId);
         return SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
+    }
 
     /* Unlock the trophy */
     s_contexts[context].unlocked[trophyId] = 1;
@@ -501,14 +593,17 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
            context, s_contexts[context].commId.data);
     printf("************************************************************\n");
 
+    /* host/trophies: the popup, then the platinum when this was the last one it needs */
+    np_trophy_event_push(trophyId, s_contexts[context].unlock_time[trophyId]);
+    const s32 plat = trophy_platinum_check(&s_contexts[context]);
+
     /* Save immediately */
     trophy_save(&s_contexts[context]);
+    np_trophy_unlock();
 
-    /* Check if all non-platinum trophies are unlocked -> platinum */
-    if (platinumId) {
-        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
-        /* Simplified: don't auto-award platinum without grade info */
-    }
+    if (platinumId)
+        vm_write32((u32)(uintptr_t)platinumId, (u32)(plat >= 0 ? plat : SCE_NP_TROPHY_INVALID_TROPHY_ID));
+    if (trophy_trace()) printf("[trophy] trace UnlockTrophy(%d) -> OK, platinum %d\n", trophyId, plat);
 
     return CELL_OK;
 }
@@ -546,6 +641,10 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     }
 
     vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
+    if (trophy_trace())
+        printf("[trophy] trace GetTrophyUnlockState -> count %u, flags %08X %08X %08X %08X\n",
+               s_contexts[context].total_trophies, vm_read32(flags_ea), vm_read32(flags_ea + 4),
+               vm_read32(flags_ea + 8), vm_read32(flags_ea + 12));
     return CELL_OK;
 }
 

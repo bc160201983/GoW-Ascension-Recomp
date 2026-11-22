@@ -1195,7 +1195,8 @@ _RC_WT_MASK = ((1 << 64) - 1) | (1 << 66)
 _RC_FLUSH_MASK = (1 << 64) | (1 << 65)
 
 
-def _cache_regs(body: list[str], wt_mask: int = _RC_WT_MASK) -> list[str]:
+def _cache_regs(body: list[str], wt_mask: int = _RC_WT_MASK,
+                flush_mask: int = _RC_FLUSH_MASK) -> list[str]:
     """The register-caching rewrite of one function body (see above). `body`
     is the list of lines between the function's braces; returns the new list.
 
@@ -1270,7 +1271,7 @@ def _cache_regs(body: list[str], wt_mask: int = _RC_WT_MASK) -> list[str]:
         for t in succs[i]:
             preds[t].append(i)
     end_falls = n == 0 or falls[n - 1]
-    flushable = _RC_FLUSH_MASK & ~wt_mask
+    flushable = flush_mask & ~wt_mask
 
     # Backward liveness of the locals: read before being overwritten. A
     # statement that hands ctx out ends every live range (whatever is read
@@ -1379,6 +1380,79 @@ def _cache_regs(body: list[str], wt_mask: int = _RC_WT_MASK) -> list[str]:
         out_lines.append(f"    {_rc_flush(end_flush)}")
     return out_lines
 
+
+
+# ---------------------------------------------------------------------------
+# codegen options (--cg a,b,...; host\codegen 2026-11-21). Each one is off
+# unless named; with no --cg the lifter writes exactly what it wrote before.
+#   st  guest stores always inline (fast path inline, slow path the out-of-line
+#       vm_write*), with the lean check: span, ref-poll word, SPU reservation
+#       bitmap (the wtrace window and g_barrier_sync_watch are diagnostics that
+#       clear vm_store_inline_ok, so vm_st_span is 0 while either can be set).
+#       Implies the PPU_LEAN_STORES header (const runtime words).
+#   vx  the VMX helpers (ppu_vmx.h) always inline.
+# ---------------------------------------------------------------------------
+CG_OPTS = ("st", "vx")
+CG_HEADER_EXTRA = """
+/* ---- codegen options (ppu_lifter.py --cg; host\\codegen) ---- */
+#if defined(PPU_CG_ST) && !defined(PPU_NO_INLINE_STORES) && !defined(PPU_VM_INL_CHECKS)
+#define PPU_CG_AI static inline __attribute__((always_inline))
+PPU_CG_AI int vm_cg_st_ok(uint32_t ea, uint32_t n)
+{
+    return __builtin_expect((uint32_t)(ea - 0x10000u) < vm_st_span, 1) && ea != vm_inl_hle &&
+           !vm_coh_hit(g_spu_coh_bitmap, ea, n);
+}
+#define PPU_CG_ST1(N, T, BS, AL) PPU_CG_AI void vm_cg_write##N(uint64_t a, T v) { \\
+    const uint32_t ea = (uint32_t)a; uint8_t* const b = vm_base; \\
+    if (__builtin_expect(vm_cg_st_ok(ea, N / 8), 1)) { v = BS(v); \\
+        if (!(ea & AL)) __atomic_store_n((T*)(b + ea), v, __ATOMIC_RELAXED); else memcpy(b + ea, &v, N / 8); \\
+        return; } \\
+    (vm_write##N)(a, v); }
+#define PPU_CG_ID(x) (x)
+PPU_CG_ST1(8, uint8_t, PPU_CG_ID, 0u)
+PPU_CG_ST1(16, uint16_t, __builtin_bswap16, 1u)
+PPU_CG_ST1(32, uint32_t, __builtin_bswap32, 3u)
+PPU_CG_ST1(64, uint64_t, __builtin_bswap64, 7u)
+#undef PPU_CG_ST1
+#undef vm_write8
+#undef vm_write16
+#undef vm_write32
+#undef vm_write64
+#define vm_write8(a, v)  vm_cg_write8(a, v)
+#define vm_write16(a, v) vm_cg_write16(a, v)
+#define vm_write32(a, v) vm_cg_write32(a, v)
+#define vm_write64(a, v) vm_cg_write64(a, v)
+#endif
+"""
+
+
+def _cg_source_defines(cg) -> list[str]:
+    out = []
+    for o in CG_OPTS:
+        if o in cg:
+            out.append(f"#define PPU_CG_{o.upper()} 1   /* ppu_lifter.py --cg {o} */")
+    if "st" in cg:
+        out.append("#ifndef PPU_LEAN_STORES")
+        out.append("#define PPU_LEAN_STORES 1   /* --cg st: the lean header (const runtime words) */")
+        out.append("#endif")
+    if "vx" in cg:
+        out.append("#define VMX_INL static inline __attribute__((always_inline))   /* --cg vx */")
+    return out
+
+
+# --cg wb (host\codegen): _cache_regs with WRITE-BACK for every slot. GPRs,
+# FPRs, CR, XER and CTR all live in their locals and are stored to ctx only
+# when they may have changed, right before a statement that hands ctx out
+# (calls, the trampoline drain, HLE, syscalls, helpers taking ctx, the hooks)
+# and before every return / trampoline hand-off / the end of the body. So ctx
+# is exact at every call, return and hand-off (all the callee, caller, runtime
+# and ABI see); in between, only this function's locals hold the registers.
+# Dead CR/XER (carry) updates inside a function fall away in the compiler.
+_RC_ALL_MASK = (1 << 67) - 1
+
+
+def _cg_pass_wb(body: list[str]) -> list[str]:
+    return _cache_regs(body, wt_mask=0, flush_mask=_RC_ALL_MASK)
 
 # ---------------------------------------------------------------------------
 # Lean stores (--lean-stores, an emission post-pass after --cache-regs)
@@ -4498,6 +4572,8 @@ class PPULifter:
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
+        if getattr(self, "cg", None):
+            lines.append(CG_HEADER_EXTRA)
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
@@ -4517,6 +4593,8 @@ class PPULifter:
                  f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
         if getattr(self, "lean_stores", False):
             lines.insert(0, "#define PPU_LEAN_STORES 1   /* ppu_lifter.py --lean-stores: see ppu_recomp.h */")
+        if getattr(self, "cg", None):
+            lines[0:0] = _cg_source_defines(self.cg)
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -5519,6 +5597,10 @@ def main() -> None:
                              "relative to r1 skip the span checks and share one "
                              "reservation check per run. Same results; needs a "
                              "runtime that defines g_ppu_stk_map (ppu_loader.cpp).")
+    parser.add_argument("--cg", default="",
+                        help="Comma list of codegen options (CG_OPTS; host\\codegen): "
+                             "st = guest stores always inline with the lean check, "
+                             "vx = VMX helpers always inline. Empty: the classic output.")
     parser.add_argument("--weak", action="store_true",
                         help="Emit lifted function definitions as weak symbols "
                              "so a port's idiomatic overrides (strong symbols "
@@ -5973,6 +6055,10 @@ def main() -> None:
     lifter.header_name = args.header_name
     lifter.cache_regs = args.cache_regs
     lifter.lean_stores = args.lean_stores
+    lifter.cg = set(o for o in args.cg.split(",") if o)
+    for _o in lifter.cg:
+        if _o not in CG_OPTS:
+            parser.error(f"--cg: unknown option {_o} (known: {', '.join(CG_OPTS)})")
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
     # no glink stub writing the save slot, so the stack read returns garbage -> r2

@@ -213,8 +213,12 @@ static int rsx_host_window_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return 0;
 }
 
+/* The in-game settings menu (rsx_ingame_menu.h) owns Esc while its panel is open: Esc closes the panel, never the
+ * game (the flag stays up for a few frames after closing, for an Esc still in the message queue). */
+__declspec(selectany) volatile long g_rsx_menu_owns_esc;
 static int rsx_host_window_esc_quits(void)
 {
+    if (g_rsx_menu_owns_esc) return 0;
     const char* e = getenv("PS3_ESC_QUITS");
     return !(e && e[0] == '0');
 }

@@ -269,7 +269,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     /* PS3_SYS_LANG=<n>: the console language, as CELL_SYSUTIL_LANG_* numbers
-     * it (0 Japanese, 1 English US, 2 Spanish, 3 French, 4 German, 5 Italian,
+     * it (0 Japanese, 1 English US, 2 French, 3 Spanish, 4 German, 5 Italian,
      * 6 Dutch, 7 Portuguese, 8 Russian, ... 16 Polish, 17 Portuguese BR,
      * 18 English UK, 19 Turkish). Titles pick their text, subtitle and voice
      * language from it. PS3_ENTER_BUTTON=circle|cross: which face button

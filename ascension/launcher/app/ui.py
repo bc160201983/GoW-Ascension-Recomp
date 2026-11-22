@@ -16,14 +16,14 @@ from .config import (ANISO_LEVELS, APP_NAME, ASPECTS, CONFIG_FILE, CONTROL_GROUP
     MP_MODES, mp_map_choices,
     ON_OFF, PAD_BUTTONS, PAD_CONTROLS, PAD_DEFAULTS, PRESETS, RENDERERS, RENDER_SCALES, ROOT, SCALE_FILTERS, SHARPEN_LEVELS, FSR_MODES, SHOT, VIBRANCE_LEVELS,
     TK_KEYS, VERSION, VOICE_LANGUAGES, VSYNC_MODES, WINDOWS, WINDOW_SIZES, asset, fps_limit, fps_unlocked, key_label,
-    load_settings,
+    load_settings, merge_ingame,
     save_settings)
 from .game import (online_on, title_id as game_title_id, online_dropped_patches, play_exe, installed_exe, lan_discover, start_lan_server, stop_lan_server, lan_server_running, take_discord_join, all_mods, backup_list, close_gently, disc_info, disc_problem, disc_ps3_game, game_running, icon_file,
     gigabytes, join_check, join_split, language_fallback, language_options, missing, prebuild_mods, prepare_game, release_disc, restore_saves, runtime_switches,
     save_dir, split_game_files, start_game, backup_saves, watch_saves, export_saves, import_saves,
     record_install, lost_save_plan, recover_save, mark_handled, any_game_running)
 from .config import RELEASE
-from .i18n import available, set_language, tr
+from .i18n import available, current, set_language, tr
 from .music import Music
 from .native import mac_dock, register_font
 from . import social
@@ -127,6 +127,8 @@ class Launcher(Look):
         root.report_callback_exception = self.callback_error   # an error in a button's code: shown and logged
         self.first_start = not CONFIG_FILE.is_file()
         self.s = load_settings()
+        if merge_ingame(self.s):     # changed in the game's own menu (F1) since the launcher last looked
+            save_settings(self.s)
         self.s['game_exe'] = installed_exe(self.s['game_exe'])   # a fresh install with an old install's settings
         self.ui_language = self.s['ui_language']       # the one this window was built in
         set_language(self.ui_language)
@@ -1219,6 +1221,113 @@ class Launcher(Look):
         return {**self.s, 'mods_dir': self.var('mods_dir').get(), 'mods_enabled': enabled,
                 'mods_order': list(getattr(self, 'mod_order', self.s['mods_order']))}
 
+    # ---- trophies (host/trophies, 2026-11-22) ----------------------------------------------------------------------
+    def build_trophies(self):
+        """Trophies page: the game's trophy list from the player's own game files, which ones the game unlocked
+        (gamedata/trophies, written by the game), the PS3's progress figure."""
+        f = self.scrolled_page('trophies', tr('Trophies'), tr('The trophies you earned in the game.'))
+        self.section(f, '', top=4)
+        self.trophy_head = self.tk.Frame(self.body(f), bg=PANEL)
+        self.put(f, self.trophy_head, sticky='we')
+        self.section(f, tr('All trophies'))
+        self.trophy_list = self.tk.Frame(self.body(f), bg=PANEL)
+        self.put(f, self.trophy_list, sticky='we')
+        self.trophy_images = []
+
+    def trophy_image(self, path, side, grey=False):
+        """A trophy icon side x side px (Pillow when present: smooth and, for locked ones, grey), else Tk's PNG."""
+        if not path:
+            return None
+        try:
+            from PIL import Image, ImageOps, ImageTk
+            with Image.open(path) as im:
+                im = im.convert('RGBA').resize((side, side), Image.LANCZOS)
+                if grey:
+                    a = im.getchannel('A')
+                    im = ImageOps.grayscale(im).convert('RGBA')
+                    im.putalpha(a.point(lambda v: v * 6 // 10))
+                return ImageTk.PhotoImage(im)
+        except (OSError, ImportError, ValueError):
+            pass
+        try:
+            img = self.tk.PhotoImage(file=str(path))
+            step = max(1, round(img.width() / side))
+            return img.subsample(step, step) if step > 1 else img
+        except Exception:   # noqa: BLE001 (a broken file: no icon)
+            return None
+
+    def refresh_trophies(self):
+        if not hasattr(self, 'trophy_list'):
+            return
+        import time as _time
+        from . import trophies as T
+        tk, px = self.tk, self.px
+        for box in (self.trophy_head, self.trophy_list):
+            for w in box.winfo_children():
+                w.destroy()
+        self.trophy_images = []
+        try:
+            data = T.load(current(), self.s)
+        except Exception:   # noqa: BLE001 (unreadable files: the page says so)
+            data = None
+        if not data:
+            tk.Label(self.trophy_head, text=tr('No trophy list yet: it is read from your game files (the disc\'s '
+                                               'PS3_GAME\\TROPDIR folder). Prepare the game on the Home page.'),
+                     bg=PANEL, fg=MUTED, font=(self.ui, 10), wraplength=px(640), justify='left').pack(anchor='w')
+            return
+        head = self.trophy_head
+        icon = self.trophy_image(data['icon'], px(64)) if data['icon'] else None
+        if icon:
+            self.trophy_images.append(icon)
+            tk.Label(head, image=icon, bg=PANEL).pack(side='left', padx=(0, px(16)))
+        text = tk.Frame(head, bg=PANEL)
+        text.pack(side='left', fill='x', expand=True)
+        tk.Label(text, text=tr('{n} of {total} trophies unlocked', n=data['unlocked'], total=data['total']),
+                 bg=PANEL, fg=TEXT, font=(self.semi, 12), anchor='w').pack(anchor='w')
+        bar = tk.Canvas(text, height=px(8), bg=PANEL, bd=0, highlightthickness=0, width=px(360))
+        bar.pack(anchor='w', pady=(px(6), px(4)))
+        w = px(360)
+        bar.create_rectangle(0, 0, w, px(8), fill=LINE, outline='')
+        bar.create_rectangle(0, 0, max(0, round(w * data['percent'] / 100)), px(8), fill=GOLD, outline='')
+        c = data['counts']
+        tk.Label(text, text=tr('{pct}% complete', pct=data['percent']) + '   ·   ' + '   '.join(
+            f"{tr(T.GRADES[g])} {c[g][0]}/{c[g][1]}" for g in 'PGSB'),
+            bg=PANEL, fg=MUTED, font=(self.ui, 9), anchor='w').pack(anchor='w')
+        colours = {'P': '#b9d3ee', 'G': '#e8c25a', 'S': '#c9ced6', 'B': '#c8834e'}
+        side = px(56)
+        for i, r in enumerate(T.ordered(data['trophies'])):
+            if i:
+                tk.Frame(self.trophy_list, bg=LINE, height=1).pack(fill='x')
+            line = tk.Frame(self.trophy_list, bg=PANEL, pady=px(7))
+            line.pack(fill='x')
+            secret = r['hidden'] and not r['unlocked']
+            img = None if secret else self.trophy_image(r['icon'], side, grey=not r['unlocked'])
+            if img:
+                self.trophy_images.append(img)
+                tk.Label(line, image=img, bg=PANEL, width=side, height=side).pack(side='left', padx=(0, px(14)))
+            else:
+                blank = tk.PhotoImage(width=side, height=side)   # the same size as an icon
+                self.trophy_images.append(blank)
+                tk.Label(line, image=blank, text='?', compound='center', bg='#1c1c20', fg=MUTED,
+                         font=(self.semi, 18), bd=0).pack(side='left', padx=(0, px(14)))
+            mid = tk.Frame(line, bg=PANEL)
+            mid.pack(side='left', fill='x', expand=True)
+            name = tr('Hidden trophy') if secret else r['name']
+            detail = tr('Keep playing to find out.') if secret else r['detail']
+            tk.Label(mid, text=name, bg=PANEL, fg=TEXT if r['unlocked'] else '#b8b0a8', font=(self.semi, 11),
+                     anchor='w').pack(anchor='w')
+            tk.Label(mid, text=detail, bg=PANEL, fg=MUTED, font=(self.ui, 9), anchor='w', justify='left',
+                     wraplength=px(470)).pack(anchor='w')
+            end = tk.Frame(line, bg=PANEL)
+            end.pack(side='right', padx=(px(10), 0))
+            tk.Label(end, text='\u25cf ' + tr(T.GRADES[r['grade']]), bg=PANEL, fg=colours[r['grade']],
+                     font=(self.semi, 9), anchor='e').pack(anchor='e')
+            when = (tr('Unlocked {date}', date=_time.strftime('%Y-%m-%d %H:%M', _time.localtime(r['time'])))
+                    if r['unlocked'] and r['time'] else tr('Unlocked') if r['unlocked'] else tr('Locked'))
+            tk.Label(end, text=when, bg=PANEL, fg='#62cf7a' if r['unlocked'] else MUTED, font=(self.ui, 9),
+                     anchor='e').pack(anchor='e')
+        self.root.after_idle(lambda: self.root.event_generate('<Configure>'))
+
     def refresh_mods(self):
         if not hasattr(self, 'mods_frame'):
             return
@@ -2108,6 +2217,7 @@ class Launcher(Look):
             return
         if self.gather() != self.saved:
             self.save()
+        self.take_ingame()           # a file left by a game the launcher did not see close
         gone = missing(self.s, split_ok=True)
         if gone:
             self.messagebox.showerror(APP_NAME, tr('Could not find {items}.\nSet it in Advanced.', items=tr(' and ').join(gone)))
@@ -2317,13 +2427,32 @@ class Launcher(Look):
         except RuntimeError:     # the launcher closed first
             pass
 
+    def take_ingame(self, show=True):
+        """What the player changed in the game's own menu (F1 / hold SELECT):
+        into the settings, the settings file and, with `show`, the pages. Edits
+        on the pages that are not saved yet stay as they are."""
+        changed = merge_ingame(self.s)
+        if not changed:
+            return
+        save_settings(self.s)
+        if not show:
+            return
+        for key, value in changed.items():
+            if key in self.vars:
+                self.vars[key].set(value)
+                self.saved[key] = value
+        self.refresh_status(tr('Settings changed in the game were saved.'))
+
     def game_ended(self, code):
         self.log.close()
         self.process = None
         if getattr(self, 'closing', False):
+            self.take_ingame(show=False)
             return                   # the launcher is closing it (close): nothing to show
         self.log_append(self.game_log, self.game_tail.read())
         self.play_button.configure(text=tr('PLAY'), state='normal')
+        if self.current == 'trophies':
+            self.refresh_trophies()   # host/trophies: what the game just unlocked
         if self.embedded or not WINDOWS:
             self.leave_game_view()
         if self.hidden_for_game:
@@ -2336,7 +2465,9 @@ class Launcher(Look):
             self.music.play()
         if code == 0:
             self.refresh_status(tr('Game closed.'))
+            self.take_ingame()
             return
+        self.take_ingame()           # also when the game stopped with an error (the messages below follow)
         if (code & 0xFFFFFFFF) == 0xC000001D:   # STATUS_ILLEGAL_INSTRUCTION: the CPU has no AVX2/FMA (the exe needs them)
             self.refresh_status(tr('Your processor is not supported (no AVX2).'))
             if self.messagebox.askyesno(APP_NAME, tr(AVX2_MESSAGE, code=code)):

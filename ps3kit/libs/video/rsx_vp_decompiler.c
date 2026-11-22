@@ -282,6 +282,7 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
     u32 input_mask, const u8* raw_kind, char* out, u32 out_size);
+static const signed char* s_vp_pull_slot;   /* GP_PULL: set around one rsx_vp_decompile_impl call */
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -359,6 +360,90 @@ static const char k_vp_raw_decode[] =
     "    }\n"
     "    return o;\n"
     "}\n";
+
+/* GP_PULL: the raw buffer, the quotient table and the per-slot base / stride. Load = aligned dwords + a funnel
+ * shift (byte offsets 1-3 allowed); the decode is vdec's with s16n / u8n / cmp read from the table, whose values
+ * are the CPU converter's IEEE quotients (division on the GPU is not correctly rounded). */
+static const char k_vp_pull_decl[] =
+    "ByteAddressBuffer gp_vb : register(t20);\n"
+    "ByteAddressBuffer gp_tab : register(t21);\n"
+    "cbuffer GPConst : register(b4) { uint4 gp_c[9]; };\n";
+static const char k_vp_pull_fn[] =
+    "uint4 gp_ld(uint b, uint st, uint v, uint nw) {\n"
+    "    uint a = b + v * st; uint al = a & ~3u; uint sh = (a & 3u) * 8u;\n"
+    "    uint4 d = gp_vb.Load4(al);\n"
+    "    uint e = nw > 3u ? gp_vb.Load(al + 16u) : 0u;\n"
+    "    if (sh == 0u) return d;\n"
+    "    uint r = 32u - sh;\n"
+    "    return uint4((d.x >> sh) | (d.y << r), (d.y >> sh) | (d.z << r), (d.z >> sh) | (d.w << r), (d.w >> sh) | (e << r));\n"
+    "}\n"
+    "float gp_t(uint i) { return asfloat(gp_tab.Load(i * 4u)); }\n"
+    "float4 gp_vdec(uint4 w, uint t, uint n) {\n"
+    "    if (t == 6u) { uint x = vb_sw(w.x);\n"
+    "        return float4(gp_t(65792u + (x & 0x7FFu)), gp_t(65792u + ((x >> 11) & 0x7FFu)), gp_t(67840u + (x >> 22)), 1.0); }\n"
+    "    float4 o = float4(0, 0, 0, 1);\n"
+    "    [unroll] for (uint c = 0u; c < 4u; c++) {\n"
+    "        if (c < n) {\n"
+    "            float v = 0.0;\n"
+    "            if (t == 2u) v = asfloat(vb_sw(w[c]));\n"
+    "            else if (t == 3u) v = vb_f16(vb_h(w, c));\n"
+    "            else if (t == 1u) v = gp_t(vb_h(w, c));\n"
+    "            else if (t == 5u) v = vb_s16(vb_h(w, c));\n"
+    "            else if (t == 4u) v = gp_t(65536u + vb_b(w, c));\n"
+    "            else if (t == 7u) v = (float)vb_b(w, c);\n"
+    "            o[c] = v;\n"
+    "        }\n"
+    "    }\n"
+    "    return o;\n"
+    "}\n";
+/* 32-bit words an element of kind (t, n) covers from its first byte. */
+static u32 vp_pull_words(u32 t, u32 n)
+{
+    if (t == 2u) return n ? n : 1u;
+    if (t == 1u || t == 3u || t == 5u) return (2u * n + 3u) / 4u ? (2u * n + 3u) / 4u : 1u;
+    return 1u;
+}
+
+int rsx_vp_decompile_pulled(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    const u8 raw_kind[16], const signed char pull_slot[16], char* out, u32 out_size)
+{
+    if (!raw_kind || !pull_slot) return -1;
+    rsx_vp_input_analysis analysis;
+    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
+        !analysis.exact ||
+        (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
+        input_mask = 0xFFFFu;
+    else
+        input_mask = analysis.input_mask;
+    s_vp_pull_slot = pull_slot;
+    const int r = rsx_vp_decompile_impl(ucode, max_bytes, vtex_mask, 1, input_mask, raw_kind, out, out_size);
+    s_vp_pull_slot = NULL;
+    return r;
+}
+
+int rsx_vp_pull_check_source(char* out, u32 out_size)
+{
+    const int n = snprintf(out, out_size, "%s%s%s%s", k_vp_raw_decode,
+        "ByteAddressBuffer gp_vb : register(t0);\n"
+        "ByteAddressBuffer gp_tab : register(t1);\n"
+        "RWByteAddressBuffer gp_out : register(u0);\n"
+        "cbuffer GPConst : register(b0) { uint4 gp_c[10]; };\n",
+        k_vp_pull_fn,
+        "[numthreads(64, 1, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "    uint n = gp_c[0].x, cnt = gp_c[0].y, ostr = gp_c[0].z;\n"
+        "    uint i = id.x; if (i >= n * cnt) return;\n"
+        "    uint v = i / cnt, s = i - v * cnt;\n"
+        "    uint d = 4u + 2u * s;\n"
+        "    uint b = gp_c[d >> 2][d & 3u]; uint st = gp_c[(d + 1u) >> 2][(d + 1u) & 3u];\n"
+        "    uint kd = (gp_c[9][s >> 2] >> ((s & 3u) * 8u)) & 0xFFu; uint t = kd >> 3, nn = kd & 7u;\n"
+        "    uint nw = t == 2u ? nn : ((t == 1u || t == 3u || t == 5u) ? (2u * nn + 3u) / 4u : 1u);\n"
+        "    float4 r = kd ? gp_vdec(gp_ld(b, st, v, nw), t, nn) : asfloat(gp_ld(b, st, v, 4u));\n"
+        "    gp_out.Store4(v * ostr + s * 16u, asuint(r));\n"
+        "}\n");
+    return n > 0 && (u32)n < out_size ? n : -1;
+}
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
@@ -641,6 +726,8 @@ static int rsx_vp_decompile_impl(
             "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
             "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
             "};\n");
+    } else if (s_vp_pull_slot) {   /* GP_PULL */
+        emit(&o, "struct VSInput {\n    uint gp_vid:SV_VertexID;\n};\n");
     } else {
         emit(&o, "struct VSInput {\n");
         if (!(input_mask & 0xFFFFu))
@@ -685,6 +772,7 @@ static int rsx_vp_decompile_impl(
 
     if (raw_kind)
         emit(&o, k_vp_raw_decode);
+    if (s_vp_pull_slot) { emit(&o, k_vp_pull_decl); emit(&o, k_vp_pull_fn); }   /* GP_PULL */
     for (u32 vtu = 0; vtu < 4; vtu++) {
         if (!((vtex_mask >> vtu) & 1u)) continue;
         char decl[128];
@@ -703,6 +791,27 @@ static int rsx_vp_decompile_impl(
             "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
             "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
             "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n");
+    } else if (s_vp_pull_slot) {   /* GP_PULL: each input loaded and decoded at the clamped vertex index */
+        emit(&o,
+            "    float4 v[16];\n"
+            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n"
+            "    uint gp_v = min(input.gp_vid - gp_c[0].y, gp_c[0].x - 1u);\n");
+        static const char xyzw[4] = { 'x', 'y', 'z', 'w' };
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (!(input_mask & (1u << attr))) continue;
+            const int sl = s_vp_pull_slot[attr];
+            if (sl < 0 || sl > 15) return -1;
+            const u32 db = 4u + 2u * (u32)sl, ds = db + 1u;
+            char assignment[160];
+            const u32 k = raw_kind ? raw_kind[attr] : 0u;
+            if (k)
+                snprintf(assignment, sizeof(assignment), "    v[%u]=gp_vdec(gp_ld(gp_c[%u].%c, gp_c[%u].%c, gp_v, %uu), %uu, %uu);\n",
+                         attr, db >> 2, xyzw[db & 3u], ds >> 2, xyzw[ds & 3u], vp_pull_words(k >> 3, k & 7u), k >> 3, k & 7u);
+            else   /* a constant: a float4 at base, stride 0 */
+                snprintf(assignment, sizeof(assignment), "    v[%u]=asfloat(gp_ld(gp_c[%u].%c, gp_c[%u].%c, gp_v, 4u));\n",
+                         attr, db >> 2, xyzw[db & 3u], ds >> 2, xyzw[ds & 3u]);
+            emit(&o, assignment);
+        }
     } else {
         emit(&o,
             "    float4 v[16];\n"

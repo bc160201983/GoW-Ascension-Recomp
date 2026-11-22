@@ -454,6 +454,9 @@ static DWORD WINAPI preload_thread(LPVOID p)
             const u64 b = s_pre_bytes;
             LeaveCriticalSection(&s_lock);
             if (b < s_cache_budget) break;
+            { static int said; if (!said) { said = 1;
+                fprintf(stderr, "[tex-pack] pack bigger than LD_TEX_PACK_MB (%llu MB): decoding ahead paused at %u of %u files; the rest decode as they are used%c",
+                        (unsigned long long)(s_cache_budget >> 20), i, s_index_n, 10); } }
             Sleep(200);
         }
         EnterCriticalSection(&s_lock);
@@ -495,6 +498,46 @@ typedef struct {
     void* gpu;           /* the texture made from it, one reference held here */
 } cache_t;
 static rsx_texpack_ref_fn s_ref;
+/* Textures this module holds (rsx_texpack_owns): open addressing, 1 = deleted. */
+static uintptr_t* s_own; static u32 s_own_cap, s_own_n;
+static void own_add(const void* p)
+{
+    if ((s_own_n + 1) * 2 > s_own_cap) {
+        const u32 nc = s_own_cap ? s_own_cap * 2 : 1024;
+        uintptr_t* n = (uintptr_t*)calloc(nc, sizeof(uintptr_t));
+        if (!n) return;
+        u32 live = 0;
+        for (u32 i = 0; i < s_own_cap; i++)
+            if (s_own[i] > 1) { u32 k = (u32)((s_own[i] >> 4) * 2654435761u) & (nc - 1); while (n[k]) k = (k + 1) & (nc - 1); n[k] = s_own[i]; live++; }
+        free(s_own); s_own = n; s_own_cap = nc; s_own_n = live;
+    }
+    u32 k = (u32)(((uintptr_t)p >> 4) * 2654435761u) & (s_own_cap - 1);
+    while (s_own[k] > 1) { if (s_own[k] == (uintptr_t)p) return; k = (k + 1) & (s_own_cap - 1); }
+    s_own[k] = (uintptr_t)p; s_own_n++;
+}
+static uintptr_t* own_find(const void* p)
+{
+    if (!s_own_cap) return NULL;
+    u32 k = (u32)(((uintptr_t)p >> 4) * 2654435761u) & (s_own_cap - 1);
+    for (u32 n = 0; n < s_own_cap && s_own[k]; n++, k = (k + 1) & (s_own_cap - 1))
+        if (s_own[k] == (uintptr_t)p) return &s_own[k];
+    return NULL;
+}
+int rsx_texpack_owns(const void* gpu) { return gpu && own_find(gpu) != NULL; }
+/* [tex-pack] every 5 s while a pack is on: what the drawing thread asked of it. */
+static struct { long long finds, kept_hits, uploads, png_sync, pre_used; } s_st;
+static u64 s_gpu_bytes;
+static void stats_tick(void)
+{
+    static DWORD last;
+    const DWORD now = GetTickCount();
+    if (!last) last = now;
+    if (now - last < 5000) return;
+    last = now;
+    fprintf(stderr, "[tex-pack] per 5s: %lld lookups (%lld already on the GPU, %lld uploads: %lld preloaded, %lld PNG decoded on the drawing thread); %.0f MB of replacements on the GPU%c",
+            s_st.finds, s_st.kept_hits, s_st.uploads, s_st.pre_used, s_st.png_sync, (double)s_gpu_bytes / 1048576.0, 10);
+    memset(&s_st, 0, sizeof s_st);
+}
 #define CACHE_N 4096u
 static cache_t s_cache[CACHE_N];
 static u64 s_cache_bytes, s_use;
@@ -504,7 +547,12 @@ static void cache_drop(cache_t* c)
 {
     s_cache_bytes -= c->bytes;
     free(c->mem);
-    if (c->gpu && s_ref) s_ref(c->gpu, 0);   /* textures still using it keep their own reference */
+    if (c->gpu) {
+        uintptr_t* o = own_find(c->gpu);
+        if (o) *o = 1;
+        s_gpu_bytes -= c->bytes;
+        if (s_ref) s_ref(c->gpu, 0);   /* textures still using it keep their own reference */
+    }
     memset(c, 0, sizeof *c);
 }
 
@@ -516,6 +564,8 @@ int rsx_texpack_find(u64 hash, u32 orig_w, u32 orig_h, u32 orig_mips, int same_s
     const int ip = index_pos(hash);
     if (ip < 0) return 0;
     s_ref = ref;
+    s_st.finds++;
+    stats_tick();
     const u64 key = hash ? hash : 1;
     u32 slot = (u32)((key * P1) >> 52) & (CACHE_N - 1), free_slot = CACHE_N;
     cache_t* c = NULL;
@@ -527,7 +577,7 @@ int rsx_texpack_find(u64 hash, u32 orig_w, u32 orig_h, u32 orig_mips, int same_s
     if (c) {
         if (c->failed) return 0;
         c->use = ++s_use;
-        if (c->gpu) { s_ref(c->gpu, 1); *gpu = c->gpu; return 1; }
+        if (c->gpu) { s_ref(c->gpu, 1); *gpu = c->gpu; s_st.kept_hits++; return 1; }
         if (!c->mem) return 0;
         *out = &c->img;
         return 1;
@@ -542,6 +592,7 @@ int rsx_texpack_find(u64 hash, u32 orig_w, u32 orig_h, u32 orig_mips, int same_s
         LeaveCriticalSection(&s_lock);
     }
     const char* why = from_pre ? NULL : chain_load(hash, &ch);
+    if (from_pre) s_st.pre_used++; else s_st.png_sync++;
     if (free_slot == CACHE_N) {   /* full probe window: the least recently used one in it goes */
         u32 best = slot;
         for (u32 p = 1; p < 64; p++) if (s_cache[(slot + p) & (CACHE_N - 1)].use < s_cache[best].use) best = (slot + p) & (CACHE_N - 1);
@@ -590,11 +641,14 @@ int rsx_texpack_find(u64 hash, u32 orig_w, u32 orig_h, u32 orig_mips, int same_s
                 (unsigned long long)hash, from_pre ? "" : " (decoded on first use)", ch.w, ch.h, c->img.n, orig_w,
                 orig_h, s_used_n, 10);
     }
-    /* Over the memory budget: drop the least recently used replacements (not this one). */
-    while (s_cache_bytes > s_cache_budget) {
+    /* Over the memory budget: drop the least recently used decoded chains not yet on the
+     * GPU (not this one). Replacements on the GPU are kept: dropping them made every use
+     * decode its PNG again on the drawing thread (a 2.6 GB pack under the 1 GB default ran
+     * at 8 fps). Their GPU memory is reported instead (once, below). */
+    while (s_cache_bytes - s_gpu_bytes > s_cache_budget) {
         cache_t* lru = NULL;
         for (u32 i = 0; i < CACHE_N; i++)
-            if ((s_cache[i].mem || s_cache[i].gpu) && &s_cache[i] != c && (!lru || s_cache[i].use < lru->use)) lru = &s_cache[i];
+            if (s_cache[i].mem && !s_cache[i].gpu && &s_cache[i] != c && (!lru || s_cache[i].use < lru->use)) lru = &s_cache[i];
         if (!lru) break;
         cache_drop(lru);
     }
@@ -613,6 +667,15 @@ void rsx_texpack_keep(u64 hash, u32 orig_w, u32 orig_h, u32 orig_mips, void* gpu
             s_ref(gpu, 1);
             e->gpu = gpu;
             free(e->mem); e->mem = NULL;   /* the bytes now count as GPU memory */
+            own_add(gpu);
+            s_gpu_bytes += e->bytes;
+            s_st.uploads++;
+            if (s_gpu_bytes > s_cache_budget) {
+                static int said;
+                if (!said) { said = 1;
+                    fprintf(stderr, "[tex-pack] replacements now use more than LD_TEX_PACK_MB (%llu MB) of GPU memory: kept (not decoded again)%c",
+                            (unsigned long long)(s_cache_budget >> 20), 10); }
+            }
             return;
         }
     }

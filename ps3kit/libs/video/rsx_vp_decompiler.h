@@ -80,6 +80,19 @@ int rsx_vp_decompile_compact_raw_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     const u8 raw_kind[16], char* out, u32 out_size);
 
+/* GP_PULL (gpupull, private kit): the translated program with NO input layout. The vertex index (SV_VertexID,
+ * minus lo = gp_c[0].y, clamped to gp_c[0].x - 1) reads the guest's bytes from the raw buffer t20 at per-slot byte base / stride
+ * (root constants b4: dword 0 = vertex count, 1 = lo (the draw's lowest index; drawn with base vertex 0),
+ * dword 4 + 2 * slot = base, 5 + 2 * slot = stride; any alignment) and decodes them
+ * exactly as rsx_vertex_decode_element (s16n / u8n / cmp through the table t21 of the CPU's own quotients).
+ * raw_kind[attr] = type * 8 + size (0: a constant, a float4 at base, stride 0); pull_slot[attr] = the slot of
+ * attr in the layout (-1 for an attribute the layout lacks: then -1 is returned). */
+int rsx_vp_decompile_pulled(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    const u8 raw_kind[16], const signed char pull_slot[16], char* out, u32 out_size);
+/* GP_CHECK: a compute shader with the same load + decode functions (kinds read at run time). */
+int rsx_vp_pull_check_source(char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

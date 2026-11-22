@@ -57,6 +57,9 @@ int rsx_texpack_find(uint64_t hash, uint32_t orig_w, uint32_t orig_h, uint32_t o
                      void** gpu, rsx_texpack_ref_fn ref);
 /* The texture made from *out: one reference is kept, the pixels are freed. */
 void rsx_texpack_keep(uint64_t hash, uint32_t orig_w, uint32_t orig_h, uint32_t orig_mips, void* gpu);
+/* 1: a texture this module holds (its memory is counted by LD_TEX_PACK_MB, not by the
+ * texture cache's LD_TEX_CACHE_MB budget). */
+int rsx_texpack_owns(const void* gpu);
 
 /* Dump (copies the pixels; written by a background thread). bc: 1/2/3 for
  * DXT1/DXT23/DXT45 blocks (bw*bh blocks, row by row), 0 for RGBA8 rows.

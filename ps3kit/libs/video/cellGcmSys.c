@@ -1629,8 +1629,10 @@ void cellGcm_park_run_begin(void) { t_pkh_in_run = 1; }
  * calls it: ascension n218_hle.c, the EDGE job): its segment is complete, so
  * its holds end here instead of at its run's end -- a run executes job after
  * job, and holding to its end kept the walker 3-4 ms per park. */
+static void gw_pje_check(int where);   /* walker2 GW_PJE, below */
 void cellGcm_park_job_end(void)
 {
+    gw_pje_check(0);
     t_pkh_tail_ea = 0;
     if (!t_pkh_mask) return;
     for (int i = 0; i < GCM_PKH_N; i++)
@@ -1641,6 +1643,7 @@ void cellGcm_park_job_end(void)
 void cellGcm_park_kick_flush(void)
 {
     int kick = 0;
+    gw_pje_check(1);
     t_pkh_in_run = 0;
     t_pkh_tail_ea = 0;
     if (t_pkh_mask) {
@@ -1681,6 +1684,64 @@ static volatile long long s_pk_total_us;        /* completed episodes */
 static volatile unsigned long long s_pk_since;  /* s_pk_t0 while one stands, else 0 */
 static char s_pk_slots0[48];
 static unsigned long long s_pks_n, s_pks_us, s_pks_max_us, s_pks_seen, s_pks_notice_us;
+
+/* walker2 (2026-11-21, default off): park notice levers.
+ *   GW_PJE=1      at every SPU job end (cellGcm_park_job_end, the natives' front ends) and SPURS run end
+ *                 (cellGcm_park_kick_flush): if the walker stands on a park whose word has changed, kick it now
+ *                 instead of at its next poll (GCM_WALK_POLL_US, 4 ms). The writes of the job that ended are
+ *                 complete at that point.
+ *   GW_PPOLL=<us> while the walker stands on a park, its poll is at most <us> (under 1000: yield-spin).
+ *   GW_AB=1       test only: both off in every other 15 s window from the first present ([gw-ab] lines, window 0 OFF).
+ * [gw] line every 5 s with the [walk] line: kicks from job ends / run ends. */
+volatile int g_gw_on = 1;
+static int s_gw_init, s_gw_ab, s_gw_pje, s_gw_ppoll;
+static volatile long long s_gw_n[4];
+static void gw_setup(void)
+{
+    const char* e;
+    s_gw_pje = (e = getenv("GW_PJE")) != NULL && *e == '1';
+    s_gw_ppoll = (e = getenv("GW_PPOLL")) != NULL ? atoi(e) : 0; if (s_gw_ppoll < 0) s_gw_ppoll = 0;
+    s_gw_ab = (e = getenv("GW_AB")) != NULL && *e == '1';
+    if (s_gw_ab) g_gw_on = 0;
+    s_gw_init = 1;
+    if (s_gw_pje || s_gw_ppoll || s_gw_ab)
+        fprintf(stderr, "[gw] GW_PJE=%d GW_PPOLL=%d GW_AB=%d%c", s_gw_pje, s_gw_ppoll, s_gw_ab, 10);
+}
+static void gw_pje_check(int where)
+{
+    if (__builtin_expect(!s_gw_init, 0)) gw_setup();
+    if (!s_gw_pje || !g_gw_on) return;
+    const u32 pe = s_pk_ea;
+    if (pe && vm_read32(pe) != s_pk_word) { __atomic_add_fetch(&s_gw_n[where], 1, __ATOMIC_RELAXED); cellGcm_fifo_kick(); }
+}
+/* boot_main's ticker: the poll bound while parked (0 = the usual one). */
+int cellGcm_gw_park_poll_us(void)
+{
+    if (__builtin_expect(!s_gw_init, 0)) gw_setup();
+    return s_gw_ppoll && g_gw_on && s_pk_ea ? s_gw_ppoll : 0;
+}
+/* rsx_live_draw_present: GW_AB windows. */
+void cellGcm_gw_present(void)
+{
+    if (__builtin_expect(!s_gw_init, 0)) gw_setup();
+    if (!s_gw_pje && !s_gw_ppoll && !s_gw_ab) return;
+    static unsigned long long tw, t5; static int nwin; static unsigned fr;
+    const unsigned long long now = ps3_qpc_us();
+    fr++;
+    if (!t5) t5 = now;
+    if (now - t5 >= 5000000ull) {
+        t5 = now;
+        fprintf(stderr, "[gw] per 5s (%s): park kicks at job end %lld, at run end %lld%c", g_gw_on ? "ON" : "OFF",
+                (long long)__atomic_exchange_n(&s_gw_n[0], 0, __ATOMIC_RELAXED),
+                (long long)__atomic_exchange_n(&s_gw_n[1], 0, __ATOMIC_RELAXED), 10);
+    }
+    if (!s_gw_ab) return;
+    if (!tw) { tw = now; fprintf(stderr, "[gw-ab] window 0 %s from frame %u%c", g_gw_on ? "ON" : "OFF", fr, 10); return; }
+    if (now - tw >= 15000000ull) {
+        tw = now; g_gw_on = !g_gw_on;
+        fprintf(stderr, "[gw-ab] window %d %s from frame %u%c", ++nwin, g_gw_on ? "ON" : "OFF", fr, 10);
+    }
+}
 
 /* Microseconds the walker has spent in park episodes so far, the standing one
  * included. Lock-free; a reader racing an episode's end can be off by that
@@ -2328,6 +2389,20 @@ double ps3_load_turbo_hz(void)
 }
 
 static long long s_pace_period_us;   /* the cap's period, for the [pace] line */
+/* In-game menu (rsx_ingame_menu.h): the frame-rate limit changed while playing. The new period waits here and the
+ * pacer takes it at its next look, under its own lock; -1 = nothing waiting. fps <= 0: no cap. */
+static volatile long long s_pace_us_req = -1;
+void cellGcm_set_flip_pace(double fps)
+{
+    InterlockedExchange64(&s_pace_us_req, fps > 0.0 ? (long long)(1e6 / fps) : 0);
+}
+/* The limit in force (frames a second; 0: none, or not read yet). */
+double cellGcm_flip_pace_fps(void)
+{
+    const long long req = s_pace_us_req;
+    const long long us = req >= 0 ? req : s_pace_period_us;
+    return us > 0 ? 1e6 / (double)us : 0.0;
+}
 /* due_out (when it returns > 0): the QPC microsecond the flip is due; now_out:
  * the clock it read (0 when there is no cap); late_out (when it returns 0: this
  * flip took the slot): how long after its due time it went, -1 when it was off
@@ -2342,6 +2417,12 @@ static long long gcm_flip_pace_left_us(long long* due_out, long long* now_out, l
         pace_us = f && atof(f) > 0 ? (long long)(1e6 / atof(f))
                 : e ? (long long)(atof(e) * 1000.0) : 0;
         s_pace_period_us = pace_us;
+    }
+    if (s_pace_us_req >= 0) {   /* in-game menu: a new limit (rare; the pacer's lock makes the change whole) */
+        AcquireSRWLockExclusive(&lock);
+        const long long req = InterlockedExchange64(&s_pace_us_req, -1);
+        if (req >= 0) { pace_us = req; s_pace_period_us = req; last_flip_us = 0; }
+        ReleaseSRWLockExclusive(&lock);
     }
     if (now_out) *now_out = 0;
     if (pace_us <= 0) return 0;
@@ -2599,6 +2680,7 @@ void cellGcm_pace_note_tick_past(double past_us, int precise)
 
 /* Called right before each Present (rsx_live_draw.c ld_present), on the
  * walker thread. */
+static u32 s_p2_833, s_p2_167, s_p2_333, s_p2_50;   /* gpupull step 3 [pace2] */
 void cellGcm_pace_note_present(void)
 {
     if (s_pace_log < 0) { const char* e = getenv("GCM_PACE_LOG"); s_pace_log = !(e && *e == '0'); }
@@ -2609,6 +2691,10 @@ void cellGcm_pace_note_present(void)
         gcm_pace_bin(s_pace.ivl, PACE_IVL_BINS, d, &s_pace.ivl_max, &s_pace.n_ivl);
         s_pace.ivl_sum += (double)d; s_pace.ivl_sq += (double)d * (double)d;
         if (d >= 20000) s_pace.n_ivl20++;
+        if (d >= 8333) s_p2_833++;
+        if (d >= 16667) s_p2_167++;
+        if (d >= 33333) s_p2_333++;
+        if (d >= 50000) s_p2_50++;
     }
     s_pace.last_present = now;
     if (s_pace.rel_t) {
@@ -2648,6 +2734,16 @@ void cellGcm_pace_note_present(void)
             s_pace.n_ppast, gcm_pace_q(s_pace.ppast, PACE_SHORT_BINS, s_pace.n_ppast, 0.50),
             gcm_pace_q(s_pace.ppast, PACE_SHORT_BINS, s_pace.n_ppast, 0.99), s_pace.ppast_max, s_pace.n_ppast500,
             s_pace.n_tclamp, s_pace.tclamp_max, 10);
+    { u32 k = (n + 99) / 100, left = k; double sum = 0.0;
+      for (int b = PACE_IVL_BINS - 1; b >= 0 && left; b--) {
+          u32 c = s_pace.ivl[b]; if (!c) continue; if (c > left) c = left;
+          const double v = (b == PACE_IVL_BINS - 1) ? (double)s_pace.ivl_max : (double)b * 10.0 + 5.0;
+          sum += v * c; left -= c;
+      }
+      const double low = k ? sum / (double)k / 1000.0 : 0.0;
+      fprintf(stderr, "[pace2] per 5s: frames %u, >=8.33 ms %u, >=16.7 ms %u, >=33.3 ms %u, >=50 ms %u, slowest 1%% (%u) mean %.3f ms = %.1f fps%c",
+              n, s_p2_833, s_p2_167, s_p2_333, s_p2_50, k, low, low > 0.0 ? 1000.0 / low : 0.0, 10);
+      s_p2_833 = s_p2_167 = s_p2_333 = s_p2_50 = 0; }
     const long long lp = s_pace.last_present, rt = s_pace.rel_t;
     memset(&s_pace, 0, sizeof s_pace);
     s_pace.last_present = lp; s_pace.rel_t = rt; s_pace.win0 = now;

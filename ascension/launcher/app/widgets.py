@@ -20,7 +20,7 @@ GOLD, GOLD_HI, INK = '#d9a441', '#e7b85c', '#15110a'
 RED, RED_HI, RED_DK, GREEN, AMBER, TRACK = '#c0202a', '#d0262e', '#96141a', '#62cf7a', '#d9a441', '#3a3a40'
 
 # Glyphs of Windows' icon font (Segoe Fluent Icons on 11, Segoe MDL2 Assets on 10).
-ICONS = {'online': '\ue716', 'home': '', 'graphics': '', 'game': '', 'controls': '', 'patches': '',
+ICONS = {'online': '\ue716', 'trophies': '\ue734', 'home': '', 'graphics': '', 'game': '', 'controls': '', 'patches': '',
          'mods': '', 'advanced': '', 'support': '', 'about': '', 'search': '',
          'play': '', 'check': '', 'more': '', 'cross': '', 'minus': ''}
 

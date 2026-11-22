@@ -1381,6 +1381,142 @@ s32 cellSaveDataDelete2(u32 container)
     return CELL_OK;
 }
 
+/* Delete one save folder (archeck 2026-11-21). Only plain files directly in
+ * <save root>/<dirName>; a folder with a subfolder is refused (no save has one).
+ * Returns 0 on success, else a CELL_SAVEDATA_ERROR_*. */
+static s32 savedata_remove_dir(const char* dirName)
+{
+    char save_path[1024];
+    build_save_path(save_path, sizeof(save_path), dirName);
+    if (!dir_exists(save_path)) return CELL_SAVEDATA_ERROR_NODATA;
+#ifdef _WIN32
+    char search[1100];
+    snprintf(search, sizeof(search), "%s\\*", save_path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {   /* first pass: refuse anything that is not a plain file */
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { FindClose(h); return CELL_SAVEDATA_ERROR_ACCESS_ERROR; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    h = FindFirstFileA(search, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            char f[1400];
+            snprintf(f, sizeof(f), "%s\\%s", save_path, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) SetFileAttributesA(f, FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileA(f)) { FindClose(h); printf("[cellSaveData] delete: cannot remove '%s'\n", f); return CELL_SAVEDATA_ERROR_ACCESS_ERROR; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (!RemoveDirectoryA(save_path)) { printf("[cellSaveData] delete: cannot remove folder '%s'\n", save_path); return CELL_SAVEDATA_ERROR_ACCESS_ERROR; }
+#else
+    DIR* dp = opendir(save_path);
+    if (dp) {
+        struct dirent* de;
+        while ((de = readdir(dp)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char f[1400];
+            snprintf(f, sizeof(f), "%s/%s", save_path, de->d_name);
+            if (dir_exists(f) || remove(f) != 0) { closedir(dp); return CELL_SAVEDATA_ERROR_ACCESS_ERROR; }
+        }
+        closedir(dp);
+    }
+    if (rmdir(save_path) != 0) return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+#endif
+    printf("[cellSaveData] deleted save folder '%s'\n", save_path);
+    return 0;
+}
+
+/* cellSaveDataFixedDelete: funcFixed picks one folder from the list, the folder
+ * is deleted, funcDone gets the outcome (excResult, dirName, sizeKB, hddFreeSizeKB).
+ * God of War: Ascension's Delete Profile calls this (func_002AF468): its funcFixed
+ * (func_002B015C) only picks an entry whose dirName AND listParam ("PROF0", from
+ * PARAM.SFO) match, and its funcDone (func_002B0260) stores excResult for the menu.
+ * Before this the NID was unregistered: CELL_OK faked, no callback ran, nothing was
+ * deleted and the profile stayed. */
+s32 cellSaveDataFixedDelete(CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed, CellSaveDataDoneCallback funcDone,
+                            u32 container, void* userdata)
+{
+    (void)container;
+    printf("[cellSaveData] FixedDelete()\n");
+    if (!setList || !setBuf || !funcFixed || !funcDone)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "setList/setBuf/funcFixed/funcDone is NULL");
+    if (!g_ps3_guest_caller)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_INTERNAL, "no guest caller installed");
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf);
+    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "dirListMax over CELL_SAVEDATA_DIRLIST_MAX");
+    CellSaveDataDirList* dirs = dir_max ? calloc(dir_max, sizeof(*dirs)) : NULL;
+    if (dir_max && !dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
+    u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
+    u32 count = enumerate_save_dirs(prefix ? (char*)vm_base + prefix : "", dirs, dir_max);
+    u32 listed = count < dir_max ? count : dir_max;
+    for (u32 i = 0; i < listed; i++) {   /* listParam from each folder's PARAM.SFO */
+        char p[1024];
+        CellSaveDataSystemFileParam sp;
+        build_save_path(p, sizeof(p), dirs[i].dirName);
+        read_param_sfo(p, &sp);
+        memset(dirs[i].listParam, 0, sizeof(dirs[i].listParam));
+        memcpy(dirs[i].listParam, sp.listParam,
+               strnlen(sp.listParam, sizeof(dirs[i].listParam) - 1));
+    }
+    scratch_reset();
+    u32 cb = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    u32 get = scratch_alloc(0x4C);
+    u32 set = scratch_alloc(12);
+    u32 list = listed ? scratch_alloc(listed * 48) : 0;
+    u32 done = scratch_alloc(4 + CELL_SAVEDATA_DIRNAME_SIZE + 8 + 64);
+    if (!cb || !get || !set || !done || (listed && !list)) { free(dirs); return CELL_SAVEDATA_ERROR_INTERNAL; }
+    marshal_cbresult_init(cb, CELL_SAVEDATA_CBRESULT_OK_NEXT, (u32)(uintptr_t)userdata);
+    vm_write32(get, count); vm_write32(get + 4, listed); vm_write32(get + 8, list);
+    if (listed) memcpy(vm_base + list, dirs, listed * 48);
+    free(dirs);
+    g_ps3_guest_caller((u32)(uintptr_t)funcFixed, cb, get, set, 0, 0, 0, 0, 0);
+    s32 result = marshal_cbresult_read_result(cb);
+    printf("[cellSaveData] FixedDelete: funcFixed returned %d (%u listed)\n", result, listed);
+    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST || result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM)
+        return CELL_OK;   /* the title chose nothing to delete */
+    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, "funcFixed returned an error");
+    u32 selected = vm_read32(set);
+    if (!selected) SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set no dirName");
+    const char* name = (const char*)vm_base + selected;
+    size_t len = strnlen(name, CELL_SAVEDATA_DIRNAME_SIZE);
+    if (!len || len == CELL_SAVEDATA_DIRNAME_SIZE || strchr(name, '/') || strchr(name, '\\') ||
+        strchr(name, ':') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        (prefix && strncmp(name, (const char*)vm_base + prefix, strlen((const char*)vm_base + prefix)) != 0))
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set an unusable dirName");
+    char directory[CELL_SAVEDATA_DIRNAME_SIZE];
+    memcpy(directory, name, len + 1);
+    char save_path[1024];
+    build_save_path(save_path, sizeof(save_path), directory);
+    s64 sizeKB = 0;
+    {
+        CellSaveDataFileStat* fl = calloc(256, sizeof(*fl));
+        u32 n = fl ? enumerate_save_files(save_path, fl, 256) : 0;
+        for (u32 i = 0; i < n; i++) sizeKB += (fl[i].st_size + 1023) / 1024;
+        free(fl);
+    }
+    s32 exc = savedata_remove_dir(directory);
+    printf("[cellSaveData] FixedDelete '%s' -> excResult %d\n", directory, exc);
+    marshal_cbresult_init(cb, CELL_SAVEDATA_CBRESULT_OK_NEXT, vm_read32(cb + 16));
+    vm_write32(done + 0, (u32)exc);
+    memset(vm_base + done + 4, 0, CELL_SAVEDATA_DIRNAME_SIZE);
+    memcpy(vm_base + done + 4, directory, len);
+    vm_write32(done + 4 + CELL_SAVEDATA_DIRNAME_SIZE, (u32)sizeKB);          /* sizeKB */
+    vm_write32(done + 8 + CELL_SAVEDATA_DIRNAME_SIZE, 1024 * 1024);          /* hddFreeSizeKB */
+    g_ps3_guest_caller((u32)(uintptr_t)funcDone, cb, done, 0, 0, 0, 0, 0, 0);
+    result = marshal_cbresult_read_result(cb);
+    printf("[cellSaveData] FixedDelete: funcDone returned %d\n", result);
+    if (result < 0) return CELL_SAVEDATA_ERROR_CBRESULT;
+    return exc ? exc : CELL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * Old / non-_2 variants — same wrapper pattern as the _2 versions, with
  * the same guest-callback caveat.

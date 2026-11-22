@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from .config import (CONFIG_DIR, FPS_LIMIT, GAME_EXE, GAME_ID, GAME_IDS, HERE, KNOWN_SWITCHES, LANGUAGES, LANGUAGES_US, MAC, MP_MODES,
+from .config import (CONFIG_DIR, FPS_LIMIT, GAME_EXE, GAME_ID, GAME_IDS, HERE, INGAME_FILE, KNOWN_SWITCHES, LANGUAGES, LANGUAGES_US, MAC, MP_MODES,
                      ROOT, SWITCHES, US_ID, fps_limit, mp_map_choices, WINDOWS, asset,
                      INSTALL, SHARED_CONFIG_FILE, VERSION)
 from .i18n import current, tr
@@ -823,6 +823,12 @@ def game_environment(s, switches=None):
     # could never turn skipping off (2026-11-07).
     env['PS3_SKIP_MOVIES'] = '1' if s.get('skip_movies') == '1' else '0'
     env['PS3_OVERLAY_FONT'] = str(HERE / 'Cinzel-Black.ttf')   # RPCS3's overlay in the launcher's font
+    # The game's own settings menu (F1 / hold SELECT): where it writes what the
+    # player changed, for config.merge_ingame. Only to a game that has the menu.
+    if 'PS3_INGAME_SETTINGS' in switches:
+        env['PS3_INGAME_SETTINGS'] = str(INGAME_FILE)
+    if 'LD_MENU_LANG' in switches:
+        env['LD_MENU_LANG'] = current()     # that menu in the launcher's language (en, es, pt-BR)
     # Thread placement: the walker, PPU main thread, SPU workers and SPURS
     # kernel each on their own core (EXPERIMENTS rows 26-27: +12% in heavy fights).
     if 'PS3_HOST_PIN' in switches:
@@ -846,6 +852,14 @@ def game_environment(s, switches=None):
     # turns it off, for slow graphics cards.
     if 'LD_FULLRES_FX' in switches and s.get('smooth_glow', '1') == '0':
         env.setdefault('LD_FULLRES_FX', '0')
+    # Disable dynamic shadows (2026-11-22, off by default): the game draws no shadow maps (flatter look).
+    if 'PS3_NO_SHADOWS' in switches and s.get('no_shadows', '0') == '1':
+        env.setdefault('PS3_NO_SHADOWS', '1')
+    # GPU vertex decoding (0.2.0, experimental, off by default): the GPU reads the game's vertex data itself
+    # (GP_PULL=1) and the walker hands it over directly (W_VDIRECT=3).
+    if 'GP_PULL' in switches and s.get('gp_pull', '0') == '1':
+        env.setdefault('GP_PULL', '1')
+        env.setdefault('W_VDIRECT', '3')
     # Offline Multiplayer: the mode Quick Play starts and the map of its first match
     # (the game reads them only with that patch on).
     if 'PS3_MP_MODE' in switches:
@@ -1413,6 +1427,13 @@ def recover_save(item, stamp=None):
         replaced.mkdir(parents=True, exist_ok=True)
         shutil.move(str(dst), str(replaced / item['name']))
     tmp.rename(dst)
+    try:   # host/trophies: the old folder's unlocked trophies come along with its saves (union, never removed)
+        from .trophies import install_root_of, merge_unlocks_from
+        old = install_root_of(item['files'][0]) if item['files'] else None
+        if old is not None:
+            merge_unlocks_from(old)
+    except (OSError, ValueError):
+        pass
     return replaced
 
 

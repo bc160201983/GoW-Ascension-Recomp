@@ -1054,9 +1054,46 @@ static void pad_peek(void)
     }
 }
 
+/* host\shadows (2026-11-22): "Disable dynamic shadows". God of War: Ascension reads the .data word 0x81B5B4 every frame
+ * (value 1 on the disc, never written by the game): 0 = no cascade shadow maps are drawn and the shadow-mask pass is left
+ * out, so every receiver reads "lit". PS3_NO_SHADOWS=1 starts with it 0; the in-game menu switches it live through
+ * cellPad_set_no_shadows(). Applied from the pad poll (one aligned 4-byte word). While the player wants them off the
+ * word is kept 0; switching back on writes the value read before the first change back ONCE and then leaves the word
+ * to the game again (so a write of the game's own is never undone while shadows are on). A different program (the word
+ * is not 0 or 1 there) is left alone. */
+#define PAD_SHADOW_EA 0x0081B5B4u
+static volatile long s_noshadow_want = -1;    /* -1: not read yet; 0 shadows on; 1 shadows off */
+static int s_noshadow_have = 0, s_noshadow_bad = 0, s_noshadow_done = 0; static u32 s_noshadow_disc = 1u;
+int cellPad_no_shadows_ok(void) { return !s_noshadow_bad; }   /* 0: the word is not this game's switch (menu greys the row) */
+int cellPad_no_shadows(void)
+{
+    if (s_noshadow_want < 0) { const char* e = getenv("PS3_NO_SHADOWS"); InterlockedCompareExchange(&s_noshadow_want, (e && e[0] == '1') ? 1 : 0, -1); }
+    return s_noshadow_want > 0;
+}
+void cellPad_set_no_shadows(int on) { (void)cellPad_no_shadows(); InterlockedExchange(&s_noshadow_want, on ? 1 : 0); }
+static void pad_shadow_apply(void)
+{
+    const int want = cellPad_no_shadows();
+    if (s_noshadow_bad || (!want && (!s_noshadow_have || s_noshadow_done))) return;   /* on: only the one write back */
+    const u32 cur = vm_read32(PAD_SHADOW_EA);
+    if (!s_noshadow_have) {
+        if (cur > 1u) { s_noshadow_bad = 1; printf("[shadows] word 0x%08X = 0x%X (not 0/1): not this game, switch off\n", PAD_SHADOW_EA, cur); fflush(stdout); return; }
+        s_noshadow_disc = cur ? cur : 1u; s_noshadow_have = 1;
+    }
+    const u32 to = want ? 0u : s_noshadow_disc;
+    static int s_off_kept = 0, s_game_wrote = 0;   /* s_off_kept: our 0 is in place; a later non-zero = the game's own write */
+    if (cur != to) {
+        vm_write32(PAD_SHADOW_EA, to);
+        if (want && s_off_kept) {
+            if (++s_game_wrote <= 4) { printf("[shadows] the game set 0x%08X to %u while shadows are off: set back to 0 (%d)\n", PAD_SHADOW_EA, cur, s_game_wrote); fflush(stdout); }
+        } else { printf("[shadows] dynamic shadows %s (0x%08X = %u, was %u)\n", want ? "OFF" : "ON", PAD_SHADOW_EA, to, cur); fflush(stdout); }
+    }
+    s_off_kept = want; s_noshadow_done = !want;
+}
+
 static void pad_poll_backend(void)
 {
-    pad_peek();
+    pad_peek();    pad_shadow_apply();
     /* Benign race: two threads may poll in the same tick. That costs one extra
      * sweep, never a missed or stale-forever read. */
     static unsigned long long s_last_ms = 0;
@@ -1086,8 +1123,16 @@ static void pad_poll_backend(void)
       else if (!s_host_state[0].connected) s_host_state[0] = kb;   /* connected=1 even unfocused, as before */
       if (!merge && !kb_on && !s_host_state[0].connected) s_host_state[0].connected = 1; }
 #endif
+#ifdef _WIN32
+    { extern volatile long g_pad_menu_block;   /* in-game menu open: the movie skip's presses would move its cursor */
+      if (g_pad_menu_block) return; }
+#endif
     pad_movie_skip();
 }
+
+#ifdef _WIN32
+#include "cellPad_menu.h"   /* in-game settings menu: neutral pad while its panel is open, SELECT hold */
+#endif
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -1549,6 +1594,9 @@ emit:
             else                        s_data_fresh[port_no] = 0;
         }
     }
+#ifdef _WIN32
+    if (port_no == 0 && g_pad_menu_enabled) pad_menu_gate(data);   /* in-game menu (cellPad_menu.h) */
+#endif
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 
-VERSION = '0.1.35'   # the port release (BilalReloaded); was the launcher's own 0.2
+VERSION = '0.2.0'   # the port release (BilalReloaded); was the launcher's own 0.2
 APP_NAME = 'God of War: Ascension'
 GAME_ID = 'BCES01741'      # the European disc the port is built from
 US_ID = 'BCUS98232'        # the US disc: the same program 16 bytes on (app/us_eboot.py converts its EBOOT)
@@ -112,7 +112,8 @@ SWITCHES = ('LD_PERF_OVERLAY', 'PS3_FPS_LIMIT', 'PS3_FULLSCREEN', 'PS3_WINDOW_SI
             'PS3_PAD_DEADZONE', 'PS3_RENDER_SCALE', 'PS3_VSYNC', 'PS3_ASPECT', 'PS3_SCALE_FILTER',
             'PS3_ANISO', 'PS3_RSX', 'PS3_RSX_RENDERER', 'LD_SMAA', 'LD_SHARPEN', 'LD_VIBRANCE', 'PS3_HOST_PIN', 'PS3_CPU_LIMIT',
             'PS3_DISPLAY_MATCH', 'PS3_PATCHES', 'PS3_PATCH_LIST', 'LD_PSO_PRECOMPILE',
-            'PS3_QUIT_HOLD_MS', 'OCCL', 'FSR3_NATIVE_AA', 'FSR3_FG', 'PS3_MP_MODE', 'LD_UBER', 'LD_AO', 'LD_FULLRES_FX')
+            'PS3_QUIT_HOLD_MS', 'OCCL', 'FSR3_NATIVE_AA', 'FSR3_FG', 'PS3_MP_MODE', 'LD_UBER', 'LD_AO', 'LD_FULLRES_FX', 'GP_PULL',
+            'PS3_INGAME_SETTINGS', 'LD_MENU_LANG', 'PS3_NO_SHADOWS')
 # What the source of this build reads, for when the executable cannot be looked at.
 KNOWN_SWITCHES = frozenset(SWITCHES[:12])
 # The game's clock steps 1/30 s a frame: a higher limit is faster gameplay, so
@@ -121,7 +122,10 @@ FPS_LIMIT = '30'
 # With Unlock FPS the clock follows real time, so the limit is a choice: 30
 # halves the work each second (the PS3 original runs at 30).
 FPS_CAPS = [('60', '60 FPS'), ('45', '45 FPS (120/144 Hz, VRR)'), ('40', '40 FPS (120 Hz screens)'),
-            ('30', '30 FPS (for lower-end PCs)')]
+            ('30', '30 FPS (for lower-end PCs)'), ('120', '120 FPS (experimental)'),
+            ('0', 'Unlocked (no limit)')]
+# 120 (ovl3, 2026-11-21): the game's clock keeps real time at 120 (game clock 1.000, audio real time);
+# experimental because few PCs hold it. '0' = no limit (PS3_FPS_LIMIT=0). Both also in the in-game panel.
 # The Display page's presets: what changes, the rest stays as set.
 PRESETS = {
     'low': {'fps_cap': '30', 'render_scale': '100', 'smaa': '1', 'fsr': '0', 'sharpen': '40', 'aniso': '0'},
@@ -146,7 +150,8 @@ SHORT_LABELS = {
     'scale_filter': [('linear', 'Smooth'), ('nearest', 'Sharp'), ('fsr', 'FSR 1')],
 }
 # Home's "New in" line: three short items of this release.
-NEWS = ('Saves show the real date in the game', 'Offline multiplayer: no freeze with a 1.04 update file')
+NEWS = ('Big performance update', 'In-game settings menu: F1 or hold SELECT', '120 FPS (experimental)',
+        'Trophies', 'Disable dynamic shadows', 'Long sessions no longer stop saving')
 
 # Video. The renderer: RPCS3's RSX (ps3recomp gpu/, a build with
 # -DASCENSION_RPCS3_RSX=ON) or live draw. On macOS, Vulkan is MoltenVK and
@@ -166,6 +171,18 @@ SCALE_FILTERS = [('linear', 'Smooth (bilinear)'), ('nearest', 'Sharp (pixel)'),
 VSYNC_MODES = [('auto', "Automatic (the renderer's)"), ('1', 'On'), ('0', 'Off'),
                ('vrr', 'G-Sync / FreeSync (VRR)')]
 ANISO_LEVELS = [('0', "The game's"), ('2', '2x'), ('4', '4x'), ('8', '8x'), ('16', '16x')]
+
+# The game's own settings menu (F1 or holding SELECT while playing; ps3kit
+# libs/video/rsx_ingame_menu.h) writes what the player changed there to this
+# file, next to the launcher's settings; the game gets its path in
+# PS3_INGAME_SETTINGS and never writes settings.json itself. The launcher takes
+# the file in (merge_ingame) when it starts, before a game starts and when the
+# game closes. The file holds the launcher's own keys and values:
+#   {"format": 1, "settings": {"fsr": "aa", "sharpen": "60", "fps_cap": "30"}}
+INGAME_FILE = CONFIG_FILE.parent / 'ingame-settings.json'
+INGAME_CHOICES = {'fsr': FSR_MODES, 'smaa': ON_OFF, 'sharpen': SHARPEN_LEVELS, 'vibrance': VIBRANCE_LEVELS,
+                  'fps_cap': FPS_CAPS, 'perf_overlay': ON_OFF, 'render_scale': RENDER_SCALES,
+                  'aniso': ANISO_LEVELS, 'vsync': ON_OFF, 'no_shadows': ON_OFF}
 
 # Controls: the PS3 pad's controls, grouped as the Controls page shows them,
 # with what they do in the game where that is certain. The ids are
@@ -298,6 +315,8 @@ DEFAULTS = {
     'mp_mode': 'trial1', 'mp_map': 'cycle',   # PS3_MP_MODE / PS3_MP_MAP: what Offline Multiplayer's Quick Play starts
     'occlusion': '1',   # OCCL: occlusion culling (the game's hidden-object tests answered; on by default, user 2026-11-05)
     'ambient_occlusion': '0',   # LD_AO: soft contact shadows (2026-11-15, off by default)
+    'no_shadows': '0',   # PS3_NO_SHADOWS=1: the game draws no dynamic shadow maps (2026-11-22, flatter look, off by default)
+    'gp_pull': '0',   # GP_PULL=1 + W_VDIRECT=3: GPU vertex decoding (2026-11-22, 0.2.0, experimental, off by default)
     'smooth_glow': '1',   # LD_FULLRES_FX: full-resolution glow above 1x (on in the game by default; '0' sets LD_FULLRES_FX=0)
     'uber_shaders': '0',   # LD_UBER + LD_UBER_BUDGET + LD_UBER_FAST: ubershader stand-ins while a shader is built (host uber5; NVIDIA only, off by default)
     'cpu_limit': '0',  # PS3_CPU_LIMIT: testing only, run on fewer cores (0 = all)
@@ -379,6 +398,42 @@ def load_settings():
         s['render_scale'] = DEFAULTS['render_scale']
         s['settings_version'] = 2
     return s
+
+
+def merge_ingame(s, path=None):
+    """Take the in-game menu's file into the settings `s` (changed in place).
+    Only the keys of INGAME_CHOICES with a value from the launcher's own list
+    are taken; anything else in the file is ignored. The file is deleted once
+    it was read. Returns the keys that changed with their new values ({} when
+    there was no file or nothing new): the caller saves `s` then."""
+    path = Path(path) if path else INGAME_FILE
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except OSError:
+        return {}
+    except ValueError:
+        data = None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    settings = data.get('settings') if isinstance(data, dict) and data.get('format') == 1 else None
+    if not isinstance(settings, dict):
+        return {}
+    changed = {}
+    for key, value in settings.items():
+        value = str(value)
+        if key not in INGAME_CHOICES or value not in dict(INGAME_CHOICES[key]):
+            continue
+        if key == 'vsync':
+            # The game only knows on and off. "Automatic" already means on and
+            # "G-Sync / FreeSync" already means off: those choices stay.
+            if (value == '1') == (s.get('vsync', 'auto') in ('auto', '1')):
+                continue
+        if str(s.get(key)) != value:
+            s[key] = value
+            changed[key] = value
+    return changed
 
 
 def save_settings(values):

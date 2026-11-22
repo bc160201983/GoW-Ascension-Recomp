@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.0 (beta), 2026-11-22
+
+### Big performance update
+All numbers below were measured during development on our test PCs (a 16-core Ryzen 9 9950X3D desktop, limited to fewer cores for the
+low-core numbers, against 0.1.35). Your results will be different.
+
+- **Native job pool:** the game's background jobs (the PS3's SPU work) now run on a pool of normal PC threads. This
+  helps PCs with few cores the most: with 2 cores we measured 2 to 2.6 times the frame rate of 0.1.35; with 4 cores
+  +24% to +35%. (These 2- and 4-core numbers were measured with the new GPU vertex decoding switched on; see below.)
+- **Faster recompiled game code:** busy fights run 17-19% faster on our test PCs.
+- **Background jobs in a better order:** the jobs that the next frame waits for most now go first. Some opening areas
+  run 17-22% faster on our test PCs.
+- **SPURS task fix:** a part of the PS3 job system now runs on the same fast path as the rest.
+- **GPU vertex decoding (experimental, off by default):** new checkbox in the launcher (Graphics, Shaders). The
+  graphics card decodes the game's 3D model data itself instead of the processor. Faster in busy scenes, mostly on PCs
+  with few CPU cores. Turn it off if something looks wrong.
+
+### In-game settings menu
+Press **F1** on the keyboard, or **hold SELECT** on the controller, while playing. Change graphics settings without
+going back to the launcher; most changes apply at once, the rest after a restart. Your choices are saved for the
+launcher. The menu is new: please tell us if a key or button does not work with your controller.
+
+### Trophies
+The game's trophies now unlock while you play, with a small popup when you earn one. The launcher has a new
+**Trophies** page: it lists the game's trophies (read from your own game files) and shows which ones you earned.
+Unlocks are kept in `ascension-recomp\ascension\gamedata\trophies`; extracting over your old folder keeps them.
+
+### Disable dynamic shadows (option)
+New checkbox in the launcher (Graphics, Lighting), **off by default**: "Disable dynamic shadows (flatter look)". The game
+stops drawing its real-time shadows, so the picture looks brighter and flatter. It can also be switched while playing
+(F1 menu, Display).
+
+### Frame rate limits
+- New **120 FPS (experimental)** limit, in the launcher and in the in-game menu. Only a strong CPU holds it, and even on our
+  fastest test PC some busy areas stay below 120.
+- New **Unlocked** option (no limit).
+
+### Fixes
+- **Saving in long sessions:** Long play sessions no longer stop saving after about 40-60 minutes (progress could be lost when returning to the menu).
+- **Delete Profile** in the game's profile screen now really deletes the profile.
+
+### Known issue
+- After Continue in the first Megaera fight, Kratos may appear without his head and wrist chains; a new game is fine.
+
 ## 0.1.35 (beta), 2026-11-18
 
 ### Saves: the real date

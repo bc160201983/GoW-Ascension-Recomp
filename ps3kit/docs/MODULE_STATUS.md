@@ -112,14 +112,14 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sceNpMatching2 | NP Matching | **Complete** | Rooms, signaling and callbacks over a psnr server (removed from this source release) with `PS3_NET_ONLINE`; offline, operations return SERVER_NOT_AVAILABLE |
 | sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
 | sceNpSns | NP SNS | **Complete** | Facebook/Twitter stubs, operations return NOT_CONNECTED |
-| sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking |
+| sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking; the trophy set (names, grades, icons) read from the game's own TROPDIR TRP file (np_trophy_data.c), an unlock popup in live draw (0.2.0) |
 | sceNpUtil | NP Utility | **Complete** | Bandwidth test (fake 100Mbps), NP environment, online ID validation, parental control |
 
 ## System Utilities (cellSysutil sub-modules)
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSaveData | Save Data | **Complete** | Callback-driven save/load, directory enumeration, file ops, simplified PARAM.SFO |
+| cellSaveData | Save Data | **Complete** | Callback-driven save/load, directory enumeration, file ops, simplified PARAM.SFO; cellSaveDataFixedDelete (the game's Delete Profile, 0.2.0) |
 | cellGame | Game Utility | **Complete** | Boot check, content permit, param read, data directory management |
 | cellMsgDialog | Message Dialog | **Complete** | Prints to stdout, auto-responds YES/OK, progress bar tracking |
 | cellOskDialog | OSK Dialog | **Complete** | UTF-16 support, configurable default response, async pattern |
@@ -132,7 +132,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md |
+| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md. 0.2.0: jobs can run on a native pool of host threads (zp_pool.inc) and SPURS tasks take the same fast path (runtime/spu/spu_stask.inc) |
 | cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
 | cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
 | cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
